@@ -8,10 +8,13 @@ from langchain.tools import tool
 from langchain_classic.retrievers import EnsembleRetriever
 from pydantic import BaseModel
 import os
+import shutil
 from langchain.agents import create_agent
 from langchain.agents.structured_output import ToolStrategy
 from langchain_community.utilities import SQLDatabase
+from langchain_core.documents import Document
 
+from extract_images import extract_and_caption_images
 from extract_tables import extract_pdf_tables
 
 load_dotenv()
@@ -36,10 +39,28 @@ text_splitter = RecursiveCharacterTextSplitter(
 
 chunks = text_splitter.split_documents(docs)
 
+image_descriptions = extract_and_caption_images(file_name)
+
+image_chunks = [
+    Document(
+        page_content=item["description"],
+        metadata={
+            "source": item["image_path"],
+            "type": "image_caption",
+        },
+    )
+    for item in image_descriptions
+]
+
+chunks.extend(image_chunks)
+
 embeddings = OpenAIEmbeddings(
     model="text-embedding-3-small",
     api_key=api_key
 )
+
+if os.path.exists("chroma_db"):
+    shutil.rmtree("chroma_db")
 
 vectorstore = Chroma.from_documents(
     documents=chunks,
@@ -49,8 +70,6 @@ vectorstore = Chroma.from_documents(
 
 bm25_retriever = BM25Retriever.from_documents(chunks)
 bm25_retriever.k = 4
-
-document_ids = vectorstore.add_documents(documents=chunks)
 
 semantic_retriever = vectorstore.as_retriever(
     search_type="similarity",
