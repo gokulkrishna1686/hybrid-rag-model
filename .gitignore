@@ -3,3 +3,4 @@
 data_files/
 chroma_db/
 *.db
+__pycache__/
