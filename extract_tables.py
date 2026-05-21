@@ -7,6 +7,8 @@ import os
 
 def clean_column_name(col):
 
+    col = "" if col is None else str(col)
+
     col = col.replace("\n", " ")
 
     col = col.strip()
@@ -69,6 +71,19 @@ def extract_pdf_tables(pdf_path):
                     clean_column_name(col)
                     for col in df.columns
                 ]
+
+                # ensure unique, non-empty column names
+                seen = {}
+                unique_cols = []
+                for i, col in enumerate(df.columns):
+                    col = col or f"col_{i}"
+                    if col in seen:
+                        seen[col] += 1
+                        col = f"{col}_{seen[col]}"
+                    else:
+                        seen[col] = 0
+                    unique_cols.append(col)
+                df.columns = unique_cols
 
                 # clean cell values
                 df = df.map(clean_cell)
