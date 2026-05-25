@@ -1,7 +1,5 @@
 .env
 .venv/
 data_files/
-chroma_db/
-*.db
 __pycache__/
-images/
+processed/
