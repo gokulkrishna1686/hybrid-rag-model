@@ -40,15 +40,22 @@ def clean_cell(x):
     return x
 
 
-def extract_pdf_tables(pdf_path):
+def extract_pdf_tables(pdf_path, db_path=None):
 
     tables = []
 
-    pdf_name = os.path.splitext(
-        os.path.basename(pdf_path)
-    )[0]
+    if db_path is None:
+        pdf_name = os.path.splitext(
+            os.path.basename(pdf_path)
+        )[0]
+        db_path = f"{pdf_name}.db"
 
-    db_path = f"{pdf_name}.db"
+    db_dir = os.path.dirname(db_path)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
+    if os.path.exists(db_path):
+        os.remove(db_path)
 
     with pdfplumber.open(pdf_path) as pdf:
 
