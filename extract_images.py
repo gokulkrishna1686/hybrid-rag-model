@@ -1,6 +1,6 @@
 import fitz
 import os
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional, Literal
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -21,7 +21,16 @@ EntityType = Literal[
 
 class Entity(BaseModel):
     type: EntityType
-    colors: List[str]
+    colors: List[str] = Field(
+        description=(
+            "Descriptive color names actually visible on this entity, ordered by "
+            "prominence. Use common names like 'navy blue', 'light gray', 'pale yellow', "
+            "'forest green', 'orange', 'white', 'black'. NEVER return hex codes. "
+            "For text entities, give the color of the text itself AND its background "
+            "(e.g. ['white text', 'red background']). If unsure, omit the color "
+            "rather than guessing — do NOT default to 'black'."
+        )
+    )
     shape: Optional[str] = None
     text: Optional[str] = None
     description: str
@@ -107,17 +116,21 @@ def generate_image_captions(image_paths):
     for image_path in image_paths:
         file_id = create_file(image_path)
         response = client.responses.parse(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             instructions=(
-                "Extract a structured description of this image for retrieval. "
-                "List every distinct entity (logo, chart, text block, icon, etc.) separately. "
-                "Be precise about colors and shapes. Capture all visible text verbatim."
+                """Extract a structured description of this image for retrieval.
+                List every distinct entity (logo, chart, text block, icon, etc.) separately.
+                For colors: use descriptive names ('navy blue', 'light gray', 'orange', 'pale yellow'), NEVER hex codes.
+                Report the actual perceived color — do not default to black/white when the entity is clearly colored.
+                For text entities, report both text color and background color.
+                Be precise about shapes.
+                Capture all visible text verbatim."""
             ),
             input=[{
                 "role": "user",
                 "content": [
                     {"type": "input_text", "text": "Extract the schema."},
-                    {"type": "input_image", "file_id": file_id},
+                    {"type": "input_image", "file_id": file_id, "detail": "high"},
                 ],
             }],
             text_format=ImageSchema,
