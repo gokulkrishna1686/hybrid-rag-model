@@ -2,6 +2,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_community.retrievers import BM25Retriever
+from rank_bm25 import BM25Okapi
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from dotenv import load_dotenv
 from langchain.tools import tool
@@ -306,11 +307,12 @@ def build_agent(pdf_path, *, generate_eval=False):
             print(f"Eval dataset already exists at {eval_path}")
 
     bm25_retriever = BM25Retriever.from_documents(chunks)
-    bm25_retriever.k = 4
+    bm25_retriever.k = 3
+    bm25_debugger = BM25Okapi([doc.page_content.split() for doc in chunks])
 
     semantic_retriever = vectorstore.as_retriever(
         search_type="similarity",
-        search_kwargs={"k": 4}
+        search_kwargs={"k": 3}
     )
 
     hybrid_retriever = EnsembleRetriever(
@@ -360,7 +362,21 @@ def build_agent(pdf_path, *, generate_eval=False):
     def retrieve_context(query: str):
         """Retrieve information to help answer a query."""
 
+        bm25_scores = bm25_debugger.get_scores(query.split())
+        top_bm25 = sorted(enumerate(bm25_scores), key=lambda x: -x[1])[:4]
+        semantic_results = vectorstore.similarity_search_with_score(query, k=4)
+
+        print(f"\n{'='*30}\nQUERY: {query}\n{'='*30}")
+        print("\n===== BM25 RESULTS =====")
+        for rank, (idx, score) in enumerate(top_bm25, 1):
+            print(f"\nRank: {rank}\nBM25 Score: {score:.4f}\nchunk_id: {chunks[idx].metadata.get('chunk_id', '?')}")
+        print("\n===== SEMANTIC RESULTS =====")
+        for rank, (doc, score) in enumerate(semantic_results, 1):
+            print(f"\nRank: {rank}\nSemantic Score: {score:.4f}\nchunk_id: {doc.metadata.get('chunk_id', '?')}")
+
         retrieved_docs = hybrid_retriever.invoke(query)
+
+        type(retrieved_docs)
 
         retrieved_ids = [
             doc.metadata.get("chunk_id", "?") for doc in retrieved_docs
