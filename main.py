@@ -315,12 +315,15 @@ def build_agent(pdf_path, *, generate_eval=False):
         search_kwargs={"k": 3}
     )
 
+    semantic_weight = 0.6
+    bm25_weight = 1 - semantic_weight
+
     hybrid_retriever = EnsembleRetriever(
         retrievers=[
             bm25_retriever,
             semantic_retriever
         ],
-        weights=[0.4, 0.6]
+        weights=[bm25_weight, semantic_weight]
     )
 
     @tool
@@ -373,6 +376,18 @@ def build_agent(pdf_path, *, generate_eval=False):
         print("\n===== SEMANTIC RESULTS =====")
         for rank, (doc, score) in enumerate(semantic_results, 1):
             print(f"\nRank: {rank}\nSemantic Score: {score:.4f}\nchunk_id: {doc.metadata.get('chunk_id', '?')}")
+
+        k = 60
+        rrf_scores = {}
+        for rank, (idx, _) in enumerate(top_bm25, 1):
+            cid = chunks[idx].metadata.get("chunk_id", f"?_{idx}")
+            rrf_scores[cid] = rrf_scores.get(cid, 0) + bm25_weight / (k + rank)
+        for rank, (doc, _) in enumerate(semantic_results, 1):
+            cid = doc.metadata.get("chunk_id", "?")
+            rrf_scores[cid] = rrf_scores.get(cid, 0) + semantic_weight / (k + rank)
+        print("\n===== RRF RESULTS =====")
+        for rank, (cid, _) in enumerate(sorted(rrf_scores.items(), key=lambda x: -x[1]), 1):
+            print(f"Rank: {rank} | chunk_id: {cid}")
 
         retrieved_docs = hybrid_retriever.invoke(query)
 
