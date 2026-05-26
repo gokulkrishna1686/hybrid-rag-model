@@ -120,8 +120,8 @@ def _generate_eval_dataset(eval_path, chunk_records, table_metadata, db):
 
     tables_context = db.get_table_info() if table_metadata else ""
 
-    num_chunk_questions = max(1, round(len(eval_chunks) * 1.5))
-    num_table_questions = max(2, len(table_metadata) * 2) if table_metadata else 0
+    num_chunk_questions = max(1, round(len(eval_chunks) * 0.4))
+    num_table_questions = max(1, len(table_metadata)) if table_metadata else 0
     num_questions = num_chunk_questions + num_table_questions
 
     eval_prompt = f"""You are generating an evaluation dataset for a hybrid RAG system
