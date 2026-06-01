@@ -1,5 +1,6 @@
 import fitz
 import os
+import zipfile
 from pydantic import BaseModel, Field
 from typing import List, Optional, Literal
 from dotenv import load_dotenv
@@ -145,9 +146,57 @@ def generate_image_captions(image_paths):
     return descriptions
 
 
-def extract_and_caption_images(pdf_path, output_folder="images"):
+def extract_images_from_zip(file_path, media_prefix, output_folder="images"):
 
-    image_paths = extract_images_from_pdf(pdf_path, output_folder)
+    # docx and pptx are just zip files with images under a media folder
+    os.makedirs(output_folder, exist_ok=True)
+
+    image_paths = []
+
+    keep_ext = [".png", ".jpg", ".jpeg", ".gif", ".webp"]
+
+    with zipfile.ZipFile(file_path) as z:
+
+        for name in z.namelist():
+
+            if not name.startswith(media_prefix):
+                continue
+
+            # skip vector formats the vision model can't read (emf/wmf)
+            if os.path.splitext(name)[1].lower() not in keep_ext:
+                continue
+
+            image_bytes = z.read(name)
+
+            image_path = os.path.join(
+                output_folder,
+                os.path.basename(name)
+            )
+
+            # save image
+            with open(image_path, "wb") as f:
+                f.write(image_bytes)
+
+            image_paths.append(image_path)
+
+            print(f"Saved: {image_path}")
+
+    return image_paths
+
+
+def extract_and_caption_images(file_path, output_folder="images"):
+
+    ext = os.path.splitext(file_path)[1].lower()
+
+    if ext == ".pdf":
+        image_paths = extract_images_from_pdf(file_path, output_folder)
+    elif ext == ".docx":
+        image_paths = extract_images_from_zip(file_path, "word/media/", output_folder)
+    elif ext == ".pptx":
+        image_paths = extract_images_from_zip(file_path, "ppt/media/", output_folder)
+    else:
+        image_paths = []
+
     return generate_image_captions(image_paths)
 
 

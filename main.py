@@ -1,4 +1,3 @@
-from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_community.retrievers import BM25Retriever
@@ -19,7 +18,8 @@ import json
 import random
 
 from extract_images import extract_and_caption_images, image_to_documents
-from extract_tables import extract_pdf_tables
+from extract_tables import extract_tables
+from extract_text import load_text_docs
 
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
@@ -198,10 +198,10 @@ Tables (SQLite schema + sample rows):
     print(f"Eval dataset saved to {eval_path}")
 
 
-def build_agent(pdf_path, *, generate_eval=False):
-    """Process a PDF (with caching) and return a ready-to-use agent."""
-    pdf_hash = file_hash(pdf_path)
-    processed_dir = os.path.join("processed", pdf_hash)
+def build_agent(file_path, *, generate_eval=False):
+    """Process a file (pdf/docx/pptx, with caching) and return a ready-to-use agent."""
+    doc_hash = file_hash(file_path)
+    processed_dir = os.path.join("processed", doc_hash)
     chunks_path = os.path.join(processed_dir, "chunks.json")
     eval_path = os.path.join(processed_dir, "eval_dataset.json")
     chroma_path = os.path.join(processed_dir, "chroma_db")
@@ -210,12 +210,12 @@ def build_agent(pdf_path, *, generate_eval=False):
     os.makedirs(processed_dir, exist_ok=True)
 
     if os.path.exists(db_path) and os.path.exists(table_meta_path):
-        print(f"Tables already extracted (hash={pdf_hash[:8]}). Loading cached .db + metadata.")
+        print(f"Tables already extracted (hash={doc_hash[:8]}). Loading cached .db + metadata.")
         with open(table_meta_path, "r", encoding="utf-8") as f:
             table_metadata = json.load(f)
     else:
-        print(f"Extracting tables (hash={pdf_hash[:8]})...")
-        result = extract_pdf_tables(pdf_path, db_path=db_path)
+        print(f"Extracting tables (hash={doc_hash[:8]})...")
+        result = extract_tables(file_path, db_path=db_path)
         table_metadata = result["table_metadata"]
         with open(table_meta_path, "w", encoding="utf-8") as f:
             json.dump(table_metadata, f, indent=4, ensure_ascii=False)
@@ -231,7 +231,7 @@ def build_agent(pdf_path, *, generate_eval=False):
     )
 
     if os.path.exists(chunks_path) and os.path.exists(chroma_path):
-        print(f"PDF already processed (hash={pdf_hash[:8]}). Loading cached chunks + vectorstore.")
+        print(f"File already processed (hash={doc_hash[:8]}). Loading cached chunks + vectorstore.")
         with open(chunks_path, "r", encoding="utf-8") as f:
             chunk_records = json.load(f)
 
@@ -253,9 +253,8 @@ def build_agent(pdf_path, *, generate_eval=False):
             embedding_function=embeddings
         )
     else:
-        print(f"Processing PDF (hash={pdf_hash[:8]})...")
-        loader = PyPDFLoader(pdf_path)
-        docs = loader.load()
+        print(f"Processing file (hash={doc_hash[:8]})...")
+        docs = load_text_docs(file_path)
 
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=400,
@@ -266,7 +265,7 @@ def build_agent(pdf_path, *, generate_eval=False):
         chunks = text_splitter.split_documents(docs)
 
         images_dir = os.path.join(processed_dir, "images")
-        image_descriptions = extract_and_caption_images(pdf_path, output_folder=images_dir)
+        image_descriptions = extract_and_caption_images(file_path, output_folder=images_dir)
 
         image_chunks = []
         for item in image_descriptions:
@@ -429,8 +428,8 @@ def build_agent(pdf_path, *, generate_eval=False):
     )
 
 
-def run_cli(pdf_path):
-    agent = build_agent(pdf_path, generate_eval=True)
+def run_cli(file_path):
+    agent = build_agent(file_path, generate_eval=False)
 
     while True:
         user_query = input("\nYou: ")
@@ -454,5 +453,5 @@ def run_cli(pdf_path):
 
 
 if __name__ == "__main__":
-    file_name = "data_files/Employee Performance.pdf"
+    file_name = "data_files/Employee Performance.docx"
     run_cli(file_name)
