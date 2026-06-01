@@ -72,6 +72,50 @@ def file_hash(path):
         return hashlib.md5(f.read()).hexdigest()
 
 
+def split_parent_child(
+    docs,
+    parent_chunk_size=2000,
+    parent_chunk_overlap=200,
+    child_chunk_size=400,
+    child_chunk_overlap=50,
+):
+    """
+    Two-level split:
+      - parents: big chunks that carry enough context to answer with.
+      - children: small chunks we actually embed + run BM25 on (precise matching).
+    Each child stores the parent_id it came from so we can swap it back at
+    retrieval time.
+
+    Returns (children, parents_by_id).
+    """
+    parent_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=parent_chunk_size,
+        chunk_overlap=parent_chunk_overlap,
+        add_start_index=True,
+    )
+    child_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=child_chunk_size,
+        chunk_overlap=child_chunk_overlap,
+        add_start_index=True,
+    )
+
+    parents = parent_splitter.split_documents(docs)
+
+    children = []
+    parents_by_id = {}
+
+    for p_idx, parent in enumerate(parents):
+        parent_id = f"parent_{p_idx}"
+        parent.metadata["parent_id"] = parent_id
+        parents_by_id[parent_id] = parent
+
+        # split_documents copies the parent's metadata onto each child,
+        # so parent_id (and source/page) ride along automatically.
+        children.extend(child_splitter.split_documents([parent]))
+
+    return children, parents_by_id
+
+
 def _generate_eval_dataset(eval_path, chunk_records, table_metadata, db):
     print("Generating eval dataset (LLM)...")
 
@@ -203,6 +247,7 @@ def build_agent(file_path, *, generate_eval=False):
     doc_hash = file_hash(file_path)
     processed_dir = os.path.join("processed", doc_hash)
     chunks_path = os.path.join(processed_dir, "chunks.json")
+    parents_path = os.path.join(processed_dir, "parents.json")
     eval_path = os.path.join(processed_dir, "eval_dataset.json")
     chroma_path = os.path.join(processed_dir, "chroma_db")
     db_path = os.path.join(processed_dir, "tables.db")
@@ -230,10 +275,12 @@ def build_agent(file_path, *, generate_eval=False):
         api_key=api_key
     )
 
-    if os.path.exists(chunks_path) and os.path.exists(chroma_path):
+    if os.path.exists(chunks_path) and os.path.exists(chroma_path) and os.path.exists(parents_path):
         print(f"File already processed (hash={doc_hash[:8]}). Loading cached chunks + vectorstore.")
         with open(chunks_path, "r", encoding="utf-8") as f:
             chunk_records = json.load(f)
+        with open(parents_path, "r", encoding="utf-8") as f:
+            parent_records = json.load(f)
 
         chunks = [
             Document(
@@ -243,10 +290,23 @@ def build_agent(file_path, *, generate_eval=False):
                     "page": rec["page"],
                     "start_index": rec["start_index"],
                     "chunk_id": rec["chunk_id"],
+                    "parent_id": rec.get("parent_id"),
                 }
             )
             for rec in chunk_records
         ]
+
+        parents_by_id = {
+            rec["parent_id"]: Document(
+                page_content=rec["text"],
+                metadata={
+                    "source": rec["document"],
+                    "page": rec["page"],
+                    "parent_id": rec["parent_id"],
+                }
+            )
+            for rec in parent_records
+        }
 
         vectorstore = Chroma(
             persist_directory=chroma_path,
@@ -256,13 +316,13 @@ def build_agent(file_path, *, generate_eval=False):
         print(f"Processing file (hash={doc_hash[:8]})...")
         docs = load_text_docs(file_path)
 
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=400,
-            chunk_overlap=50,
-            add_start_index=True
+        chunks, parents_by_id = split_parent_child(
+            docs,
+            parent_chunk_size=2000,
+            parent_chunk_overlap=200,
+            child_chunk_size=400,
+            child_chunk_overlap=50,
         )
-
-        chunks = text_splitter.split_documents(docs)
 
         images_dir = os.path.join(processed_dir, "images")
         image_descriptions = extract_and_caption_images(file_path, output_folder=images_dir)
@@ -270,6 +330,12 @@ def build_agent(file_path, *, generate_eval=False):
         image_chunks = []
         for item in image_descriptions:
             image_chunks.extend(image_to_documents(item))
+
+        # images have no textual parent — each image chunk is its own parent
+        for img_idx, child in enumerate(image_chunks):
+            parent_id = f"parent_img_{img_idx}"
+            child.metadata["parent_id"] = parent_id
+            parents_by_id[parent_id] = child
 
         chunks.extend(image_chunks)
 
@@ -279,6 +345,7 @@ def build_agent(file_path, *, generate_eval=False):
             chunk.metadata["chunk_id"] = chunk_id
             chunk_records.append({
                 "chunk_id": chunk_id,
+                "parent_id": chunk.metadata.get("parent_id"),
                 "document": chunk.metadata.get('source'),
                 "page": chunk.metadata.get('page'),
                 "start_index": chunk.metadata.get('start_index'),
@@ -290,11 +357,26 @@ def build_agent(file_path, *, generate_eval=False):
         with open(chunks_path, "w", encoding="utf-8") as f:
             json.dump(chunk_records, f, indent=4, ensure_ascii=False)
 
+        # persist parents so we can rebuild parents_by_id from cache
+        parent_records = [
+            {
+                "parent_id": pid,
+                "document": p.metadata.get("source"),
+                "page": p.metadata.get("page"),
+                "type": p.metadata.get("type"),
+                "image_id": p.metadata.get("image_id"),
+                "text": p.page_content,
+            }
+            for pid, p in parents_by_id.items()
+        ]
+        with open(parents_path, "w", encoding="utf-8") as f:
+            json.dump(parent_records, f, indent=4, ensure_ascii=False)
+
         if os.path.exists(chroma_path):
             shutil.rmtree(chroma_path)
 
         vectorstore = Chroma.from_documents(
-            documents=chunks,
+            documents=chunks,           # children get embedded
             embedding=embeddings,
             persist_directory=chroma_path
         )
@@ -388,24 +470,33 @@ def build_agent(file_path, *, generate_eval=False):
         for rank, (cid, _) in enumerate(sorted(rrf_scores.items(), key=lambda x: -x[1]), 1):
             print(f"Rank: {rank} | chunk_id: {cid}")
 
-        retrieved_docs = hybrid_retriever.invoke(query)
+        retrieved_docs = hybrid_retriever.invoke(query)   # these are CHILDREN
 
-        type(retrieved_docs)
+        # swap each matched child back to its parent, dedupe by parent
+        seen_parents = set()
+        parent_docs = []
+        for doc in retrieved_docs:
+            pid = doc.metadata.get("parent_id")
+            if pid in seen_parents:
+                continue
+            seen_parents.add(pid)
+            parent_docs.append(parents_by_id.get(pid, doc))
 
         retrieved_ids = [
             doc.metadata.get("chunk_id", "?") for doc in retrieved_docs
         ]
-        print("CONTEXT RETRIEVED:", retrieved_ids)
+        print("CHILD MATCHES:", retrieved_ids)
+        print("PARENT CONTEXT:", list(seen_parents))
 
         serialized = "\n\n".join(
             (
                 f"Source: {doc.metadata}\n"
                 f"Content: {doc.page_content}"
             )
-            for doc in retrieved_docs
+            for doc in parent_docs
         )
 
-        return serialized, retrieved_docs
+        return serialized, parent_docs
 
     model = ChatOpenAI(
         model="gpt-4.1-mini",
