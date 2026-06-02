@@ -20,6 +20,7 @@ import random
 from extract_images import extract_and_caption_images, image_to_documents
 from extract_tables import extract_tables
 from extract_text import load_text_docs
+from enrich import enrich_text, redact, SENSITIVITY_ORDER, clearance_level
 
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
@@ -45,9 +46,12 @@ Tool usage rules:
 - Input must be a valid SQLite query.
 - Trust the column types from the schema (numeric columns are REAL/INTEGER — no need to CAST or strip commas).
 
-3. retrieve_context(query: str)
+3. retrieve_context(query: str, must_mention: str = "")
 - Use ONLY for semantic document retrieval, summaries, explanations, charts, images, and general report context.
 - DO NOT use this for exact table calculations or SQL-style queries.
+- If the question is clearly about ONE specific person, department, or named
+  entity, pass that name as must_mention to narrow the results. Otherwise leave
+  it empty.
 - Call AT MOST ONCE per user question. Pack everything you need to look up into a
   single rich query (combine keywords, synonyms, and the concepts you're after).
   Do NOT call it again hoping for different results.
@@ -192,7 +196,7 @@ CHUNK question mix (aim for roughly this distribution within the chunk questions
 - ~40% explanatory / conceptual questions ("why", "how", "what does X mean",
   "describe the process for Y"). Answers should be 1-2 sentence explanations.
 - ~30% paraphrased / semantic questions where the wording deliberately AVOIDS
-  the exact keywords used in the chunk (synonyms, rephrasing, indirect framing).
+  the exact keywords used in the chunk (synonyms, rephrasing,   indirect framing).
   These stress the dense retriever — BM25 should struggle on these.
 
 TABLE question style (for the table questions):
@@ -242,8 +246,12 @@ Tables (SQLite schema + sample rows):
     print(f"Eval dataset saved to {eval_path}")
 
 
-def build_agent(file_path, *, generate_eval=False):
+def build_agent(file_path, *, generate_eval=False, role="employee"):
     """Process a file (pdf/docx/pptx, with caching) and return a ready-to-use agent."""
+    # RBAC: the caller's role decides the clearance the retriever enforces.
+    clearance = clearance_level(role)
+    print(f"Agent role: {role} (clearance level {clearance})")
+
     doc_hash = file_hash(file_path)
     processed_dir = os.path.join("processed", doc_hash)
     chunks_path = os.path.join(processed_dir, "chunks.json")
@@ -303,6 +311,10 @@ def build_agent(file_path, *, generate_eval=False):
                     "source": rec["document"],
                     "page": rec["page"],
                     "parent_id": rec["parent_id"],
+                    "sensitivity": rec.get("sensitivity", "public"),
+                    "has_pii": rec.get("has_pii", False),
+                    "pii_types": rec.get("pii_types", []),
+                    "entities": rec.get("entities", []),
                 }
             )
             for rec in parent_records
@@ -339,6 +351,13 @@ def build_agent(file_path, *, generate_eval=False):
 
         chunks.extend(image_chunks)
 
+        # enrich every parent: entities (spaCy) + PII/sensitivity (Presidio).
+        # we tag PARENTS (not children) because parents are what the LLM sees,
+        # so access control + filtering happen on that unit.
+        print(f"Enriching {len(parents_by_id)} parents (entities + sensitivity)...")
+        for parent in parents_by_id.values():
+            parent.metadata.update(enrich_text(parent.page_content))
+
         chunk_records = []
         for i, chunk in enumerate(chunks):
             chunk_id = f"chunk_{i}"
@@ -365,6 +384,10 @@ def build_agent(file_path, *, generate_eval=False):
                 "page": p.metadata.get("page"),
                 "type": p.metadata.get("type"),
                 "image_id": p.metadata.get("image_id"),
+                "sensitivity": p.metadata.get("sensitivity"),
+                "has_pii": p.metadata.get("has_pii"),
+                "pii_types": p.metadata.get("pii_types"),
+                "entities": p.metadata.get("entities"),
                 "text": p.page_content,
             }
             for pid, p in parents_by_id.items()
@@ -443,8 +466,12 @@ def build_agent(file_path, *, generate_eval=False):
             return f"SQL ERROR: {str(e)}"
 
     @tool(response_format="content_and_artifact")
-    def retrieve_context(query: str):
-        """Retrieve information to help answer a query."""
+    def retrieve_context(query: str, must_mention: str = ""):
+        """Retrieve information to help answer a query.
+
+        Optionally set must_mention to a single name/term (e.g. a person or
+        department) to only keep context that explicitly mentions it.
+        """
 
         bm25_scores = bm25_debugger.get_scores(query.split())
         top_bm25 = sorted(enumerate(bm25_scores), key=lambda x: -x[1])[:4]
@@ -488,15 +515,40 @@ def build_agent(file_path, *, generate_eval=False):
         print("CHILD MATCHES:", retrieved_ids)
         print("PARENT CONTEXT:", list(seen_parents))
 
+        # --- self-query: keep only parents that mention the requested term ---
+        if must_mention:
+            needle = must_mention.lower()
+            parent_docs = [
+                p for p in parent_docs
+                if any(needle in e.lower() for e in p.metadata.get("entities", []))
+            ]
+            print(f"ENTITY FILTER '{must_mention}' -> {len(parent_docs)} parent(s) kept")
+
+        # --- RBAC: enforce clearance; redact (don't drop) what's above it ---
+        visible_docs = []
+        for p in parent_docs:
+            level = SENSITIVITY_ORDER.get(p.metadata.get("sensitivity", "public"), 0)
+            if level <= clearance:
+                visible_docs.append(p)
+            else:
+                # too sensitive for this role -> mask the PII, keep the prose
+                redacted = redact(p.page_content)
+                visible_docs.append(Document(
+                    page_content=redacted,
+                    metadata={**p.metadata, "redacted": True}
+                ))
+                print(f"REDACTED {p.metadata.get('parent_id')} "
+                      f"(sensitivity={p.metadata.get('sensitivity')} > clearance={clearance})")
+
         serialized = "\n\n".join(
             (
                 f"Source: {doc.metadata}\n"
                 f"Content: {doc.page_content}"
             )
-            for doc in parent_docs
+            for doc in visible_docs
         )
 
-        return serialized, parent_docs
+        return serialized, visible_docs
 
     model = ChatOpenAI(
         model="gpt-4.1-mini",
@@ -519,8 +571,8 @@ def build_agent(file_path, *, generate_eval=False):
     )
 
 
-def run_cli(file_path):
-    agent = build_agent(file_path, generate_eval=False)
+def run_cli(file_path, role="employee"):
+    agent = build_agent(file_path, generate_eval=False, role=role)
 
     while True:
         user_query = input("\nYou: ")
@@ -545,4 +597,6 @@ def run_cli(file_path):
 
 if __name__ == "__main__":
     file_name = "data_files/Employee Performance.docx"
-    run_cli(file_name)
+    # role controls what the retriever is allowed to surface:
+    #   guest -> public, employee -> internal, manager/hr/admin -> confidential
+    run_cli(file_name, role="employee")
