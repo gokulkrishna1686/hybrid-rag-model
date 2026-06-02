@@ -51,12 +51,11 @@ SENSITIVITY_ORDER = {
 }
 
 # RBAC: a user's role decides which tier they are cleared to see.
+# One role per tier, mapped 1:1, so the UI shows exactly three levels.
 ROLE_CLEARANCE = {
     "guest": "public",
     "employee": "internal",
     "manager": "confidential",
-    "hr": "confidential",
-    "admin": "confidential",
 }
 
 # Which Presidio PII types push a chunk into which tier.

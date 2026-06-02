@@ -200,6 +200,30 @@ def extract_and_caption_images(file_path, output_folder="images"):
     return generate_image_captions(image_paths)
 
 
+def descriptions_to_serializable(descriptions):
+    """Caption results -> plain JSON-able dicts (unpacks the pydantic schema)."""
+    return [
+        {
+            "image_path": d["image_path"],
+            "schema": d["schema"].model_dump(),
+            "description": d["description"],
+        }
+        for d in descriptions
+    ]
+
+
+def descriptions_from_serializable(data):
+    """Cached JSON -> caption results (rebuilds the pydantic schema)."""
+    return [
+        {
+            "image_path": d["image_path"],
+            "schema": ImageSchema(**d["schema"]),
+            "description": d["description"],
+        }
+        for d in data
+    ]
+
+
 def image_to_documents(item):
     """One image -> parent summary doc + N entity docs, linked by image_id."""
     from langchain_core.documents import Document  # or move to top of file

@@ -17,7 +17,12 @@ from langchain_core.documents import Document
 import json
 import random
 
-from extract_images import extract_and_caption_images, image_to_documents
+from extract_images import (
+    extract_and_caption_images,
+    image_to_documents,
+    descriptions_to_serializable,
+    descriptions_from_serializable,
+)
 from extract_tables import extract_tables
 from extract_text import load_text_docs
 from enrich import enrich_text, redact, SENSITIVITY_ORDER, clearance_level
@@ -256,6 +261,7 @@ def build_agent(file_path, *, generate_eval=False, role="employee"):
     processed_dir = os.path.join("processed", doc_hash)
     chunks_path = os.path.join(processed_dir, "chunks.json")
     parents_path = os.path.join(processed_dir, "parents.json")
+    image_cache_path = os.path.join(processed_dir, "image_descriptions.json")
     eval_path = os.path.join(processed_dir, "eval_dataset.json")
     chroma_path = os.path.join(processed_dir, "chroma_db")
     db_path = os.path.join(processed_dir, "tables.db")
@@ -336,18 +342,34 @@ def build_agent(file_path, *, generate_eval=False, role="employee"):
             child_chunk_overlap=50,
         )
 
+        # captions are expensive (gpt-4o vision per image) and never change for
+        # the same file, so cache them separately from the chunk/Chroma rebuild.
         images_dir = os.path.join(processed_dir, "images")
-        image_descriptions = extract_and_caption_images(file_path, output_folder=images_dir)
+        if os.path.exists(image_cache_path):
+            print(f"Images already captioned (hash={doc_hash[:8]}). Loading cached captions.")
+            with open(image_cache_path, "r", encoding="utf-8") as f:
+                image_descriptions = descriptions_from_serializable(json.load(f))
+        else:
+            image_descriptions = extract_and_caption_images(file_path, output_folder=images_dir)
+            with open(image_cache_path, "w", encoding="utf-8") as f:
+                json.dump(descriptions_to_serializable(image_descriptions), f,
+                          indent=4, ensure_ascii=False)
 
         image_chunks = []
         for item in image_descriptions:
             image_chunks.extend(image_to_documents(item))
 
-        # images have no textual parent — each image chunk is its own parent
+        # images have no textual parent — each image chunk is its own parent.
+        # store a SEPARATE copy as the parent: enrichment adds list metadata
+        # (entities/pii_types) to parents, and Chroma rejects list/empty-list
+        # metadata. The child we embed must stay free of those fields.
         for img_idx, child in enumerate(image_chunks):
             parent_id = f"parent_img_{img_idx}"
             child.metadata["parent_id"] = parent_id
-            parents_by_id[parent_id] = child
+            parents_by_id[parent_id] = Document(
+                page_content=child.page_content,
+                metadata=dict(child.metadata),
+            )
 
         chunks.extend(image_chunks)
 
@@ -430,6 +452,14 @@ def build_agent(file_path, *, generate_eval=False, role="employee"):
         weights=[bm25_weight, semantic_weight]
     )
 
+    # each retrieve_context call appends one record here so a UI (Streamlit)
+    # can show the same scores we print to the console.
+    retrieval_log = []
+
+    # per-turn guard so the agent can't loop on retrieve_context; reset_turn()
+    # (returned below) must be called once before each agent.invoke().
+    turn_state = {"calls": 0, "last_serialized": "", "last_docs": []}
+
     @tool
     def get_table_metadata():
         """
@@ -472,6 +502,18 @@ def build_agent(file_path, *, generate_eval=False, role="employee"):
         Optionally set must_mention to a single name/term (e.g. a person or
         department) to only keep context that explicitly mentions it.
         """
+
+        # hard cap: after the first call this turn, return the cached result
+        # with a stop instruction so the agent can't loop on this tool.
+        turn_state["calls"] += 1
+        if turn_state["calls"] > 1:
+            print(f"retrieve_context called {turn_state['calls']}x this turn -> returning cached result")
+            stop_note = (
+                "\n\n[NOTE: You already retrieved context this turn. Do NOT call "
+                "retrieve_context again. Answer using the information above, or tell the "
+                "user the information is unavailable or restricted for their access level.]"
+            )
+            return turn_state["last_serialized"] + stop_note, turn_state["last_docs"]
 
         bm25_scores = bm25_debugger.get_scores(query.split())
         top_bm25 = sorted(enumerate(bm25_scores), key=lambda x: -x[1])[:4]
@@ -526,19 +568,52 @@ def build_agent(file_path, *, generate_eval=False, role="employee"):
 
         # --- RBAC: enforce clearance; redact (don't drop) what's above it ---
         visible_docs = []
+        redacted_ids = []
         for p in parent_docs:
             level = SENSITIVITY_ORDER.get(p.metadata.get("sensitivity", "public"), 0)
             if level <= clearance:
                 visible_docs.append(p)
             else:
-                # too sensitive for this role -> mask the PII, keep the prose
+                # too sensitive for this role -> mask the PII, keep the prose,
+                # and ANNOUNCE the redaction so the agent treats it as an access
+                # block (and stops) rather than a retrieval miss (and retries).
                 redacted = redact(p.page_content)
+                marker = (
+                    f"[RESTRICTED - this content is above your '{role}' access level "
+                    f"and has been redacted. This is an access restriction, NOT a "
+                    f"missing result, so do not retry. Tell the user they are not "
+                    f"authorized to view it.]"
+                )
                 visible_docs.append(Document(
-                    page_content=redacted,
+                    page_content=f"{marker}\n{redacted}",
                     metadata={**p.metadata, "redacted": True}
                 ))
+                redacted_ids.append(p.metadata.get("parent_id"))
                 print(f"REDACTED {p.metadata.get('parent_id')} "
                       f"(sensitivity={p.metadata.get('sensitivity')} > clearance={clearance})")
+
+        # record structured debug info for the UI (mirrors the prints above)
+        retrieval_log.append({
+            "query": query,
+            "must_mention": must_mention,
+            "bm25": [
+                {"rank": r, "chunk_id": chunks[idx].metadata.get("chunk_id", "?"),
+                 "score": round(float(score), 4)}
+                for r, (idx, score) in enumerate(top_bm25, 1)
+            ],
+            "semantic": [
+                {"rank": r, "chunk_id": doc.metadata.get("chunk_id", "?"),
+                 "score": round(float(score), 4)}
+                for r, (doc, score) in enumerate(semantic_results, 1)
+            ],
+            "rrf": [
+                {"rank": r, "chunk_id": cid, "score": round(float(s), 6)}
+                for r, (cid, s) in enumerate(sorted(rrf_scores.items(), key=lambda x: -x[1]), 1)
+            ],
+            "child_matches": retrieved_ids,
+            "parents": list(seen_parents),
+            "redacted": redacted_ids,
+        })
 
         serialized = "\n\n".join(
             (
@@ -547,6 +622,10 @@ def build_agent(file_path, *, generate_eval=False, role="employee"):
             )
             for doc in visible_docs
         )
+
+        # cache for the per-turn guard (repeat calls reuse this)
+        turn_state["last_serialized"] = serialized
+        turn_state["last_docs"] = visible_docs
 
         return serialized, visible_docs
 
@@ -563,16 +642,24 @@ def build_agent(file_path, *, generate_eval=False, role="employee"):
         get_table_metadata
     ]
 
-    return create_agent(
+    agent = create_agent(
         model=model,
         tools=tools,
         response_format=ToolStrategy(ResponseFormat),
         system_prompt=prompt
     )
 
+    def reset_turn():
+        """Reset the per-turn retrieve_context guard. Call before each invoke."""
+        turn_state["calls"] = 0
+
+    # retrieval_log is shared by reference with retrieve_context so a caller can
+    # read each turn's scores. reset_turn() MUST be called before every invoke.
+    return agent, retrieval_log, reset_turn
+
 
 def run_cli(file_path, role="employee"):
-    agent = build_agent(file_path, generate_eval=False, role=role)
+    agent, _, reset_turn = build_agent(file_path, generate_eval=False, role=role)
 
     while True:
         user_query = input("\nYou: ")
@@ -581,6 +668,7 @@ def run_cli(file_path, role="employee"):
             print("Exiting...")
             break
 
+        reset_turn()
         result = agent.invoke(
             {
                 "messages": [
@@ -598,5 +686,5 @@ def run_cli(file_path, role="employee"):
 if __name__ == "__main__":
     file_name = "data_files/Employee Performance.docx"
     # role controls what the retriever is allowed to surface:
-    #   guest -> public, employee -> internal, manager/hr/admin -> confidential
+    #   guest -> public, employee -> internal, manager -> confidential
     run_cli(file_name, role="employee")
