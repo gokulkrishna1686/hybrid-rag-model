@@ -16,6 +16,8 @@ from langchain_community.utilities import SQLDatabase
 from langchain_core.documents import Document
 import json
 import random
+import re
+from typing import Literal
 
 from extract_images import (
     extract_and_caption_images,
@@ -128,14 +130,13 @@ def split_parent_child(
 def _generate_eval_dataset(eval_path, chunk_records, table_metadata, db):
     print("Generating eval dataset (LLM)...")
 
-    class ExpectedContext(BaseModel):
-        chunk_id: str | None = None
-        table_name: str | None = None
-
     class EvalItem(BaseModel):
         question: str
         ground_truth: str
-        expected_contexts: list[ExpectedContext]
+        answer_type: Literal["literal", "descriptive"]
+        keywords: list[str] = []
+        expected_chunk_ids: list[str] = []
+        expected_table_names: list[str] = []
 
     class EvalDataset(BaseModel):
         items: list[EvalItem]
@@ -178,31 +179,60 @@ def _generate_eval_dataset(eval_path, chunk_records, table_metadata, db):
     num_table_questions = max(1, len(table_metadata)) if table_metadata else 0
     num_questions = num_chunk_questions + num_table_questions
 
+    # descriptive (explanatory) answers can only come from chunk questions — table
+    # questions are naturally literal — so guarantee a healthy share of them, else
+    # the set ends up dominated by single-value lookups.
+    num_descriptive_questions = min(
+        num_chunk_questions, max(3, round(num_chunk_questions * 0.5))
+    )
+    num_literal_chunk_questions = num_chunk_questions - num_descriptive_questions
+
     eval_prompt = f"""You are generating an evaluation dataset for a hybrid RAG system
 that combines BM25 (keyword) retrieval, dense semantic retrieval, and a SQL agent
 that queries structured tables extracted from the PDF. The eval set must stress all
 three paths.
 
-Generate {num_questions} diverse evaluation questions total:
-- {num_chunk_questions} questions answerable from the CHUNKS (free-text prose + image captions)
-- {num_table_questions} questions answerable from the TABLES (SQL aggregations, lookups, filters)
+Generate exactly {num_questions} evaluation questions, split into these categories
+(these counts are a HARD requirement — match them):
+- {num_descriptive_questions} DESCRIPTIVE chunk questions — answer_type="descriptive".
+  Explanatory "why / how / describe / explain / summarize" questions whose ground_truth is
+  a 1-2 sentence explanation, each with a non-empty keywords list. Answerable from the
+  CHUNKS (prose + image captions).
+- {num_literal_chunk_questions} LITERAL chunk questions — answer_type="literal".
+  Single-value factual lookups (a name, date, number, or short phrase) from the CHUNKS.
+- {num_table_questions} TABLE questions — answer_type="literal".
+  SQL lookups, aggregations, filters, and rankings answerable from the TABLES.
+Do NOT let single-value literal lookups dominate — honour the descriptive count above.
 
 For each item provide:
 - question: a clear, specific question answerable strictly from the provided material
 - ground_truth: the concise correct answer (a value, name, phrase, or 1-2 sentence explanation)
-- expected_contexts: a list of context references. Each entry is an object with EITHER:
-    * {{"chunk_id": "chunk_N"}}  — when the answer lives in a chunk
-    * {{"table_name": "page_X_table_Y"}}  — when the answer requires querying a table
-  A single question may cite multiple contexts, and may mix chunks AND tables when
-  the answer is grounded in both.
+- answer_type: "literal" if the answer is a single exact value (a number like 8.8, a
+  boolean like True, a date, a name, an amount, or a short exact phrase); "descriptive"
+  if the answer is an explanation or 1-2 sentence summary.
+- keywords: for a "descriptive" answer, the essential terms or short phrases that MUST
+  appear in a correct answer (e.g. ["AI automation", "customer support"]), used to score
+  by keyword coverage. For a "literal" answer use an EMPTY list — the ground_truth is the
+  exact value and is matched literally.
+- expected_chunk_ids: a list of chunk_id strings (e.g. ["chunk_7"]) whose text is
+  ACTUALLY needed to answer. Copy the exact id from inside the [square brackets] in the
+  Chunks section below. Use an empty list if the answer does not come from any chunk.
+- expected_table_names: a list of table_name strings (e.g. ["page_2_table_0"]) that must
+  be queried to answer. Copy the exact name from the Tables schema below. Use an empty
+  list if the answer does not require a table.
+Include ONLY the contexts genuinely used to derive the answer. A chunk/prose question
+must have an EMPTY expected_table_names, and a table/numeric question must have an EMPTY
+expected_chunk_ids — do not attach a table that is not actually queried, nor a chunk that
+is not actually read. List both only in the rare case the answer truly needs both.
+Each list item must be a single bare id string only — never embed JSON, braces, quotes,
+or punctuation inside it.
 
-CHUNK question mix (aim for roughly this distribution within the chunk questions):
-- ~30% factual / numerical lookups that reuse rare terms verbatim — good for BM25.
-- ~40% explanatory / conceptual questions ("why", "how", "what does X mean",
-  "describe the process for Y"). Answers should be 1-2 sentence explanations.
-- ~30% paraphrased / semantic questions where the wording deliberately AVOIDS
-  the exact keywords used in the chunk (synonyms, rephrasing,   indirect framing).
-  These stress the dense retriever — BM25 should struggle on these.
+CHUNK question style:
+- Vary the descriptive questions across why / how / what-does-X-mean / describe / summarize.
+- The literal chunk lookups should reuse rare terms verbatim — good for BM25.
+- Make ~30% of the chunk questions paraphrased / semantic: phrase them so the wording
+  deliberately AVOIDS the chunk's exact keywords (synonyms, rephrasing, indirect framing)
+  to stress the dense retriever. This applies to both descriptive and literal chunk questions.
 
 TABLE question style (for the table questions):
 - Mix exact lookups ("what is the salary of employee X"), aggregations
@@ -226,22 +256,42 @@ Tables (SQLite schema + sample rows):
 
     eval_data = eval_llm.invoke(eval_prompt)
 
-    def serialize_context(ctx):
-        out = {}
-        if ctx.chunk_id:
-            out["chunk_id"] = ctx.chunk_id
-        if ctx.table_name:
-            out["table_name"] = ctx.table_name
-        return out
+    # sanitize: recover the bare id if the model garbled it (e.g. "chunk_7'}]},{")
+    # and keep only references that actually exist in the chunks/tables.
+    valid_chunk_ids = {rec["chunk_id"] for rec in eval_chunks}
+    valid_table_names = (
+        {m["table_name"] for m in table_metadata} if table_metadata else set()
+    )
+
+    def clean_chunk_id(raw):
+        match = re.search(r"chunk_\d+", raw)
+        return match.group(0) if match else None
+
+    def build_contexts(item):
+        contexts = []
+        seen = set()
+        for raw in item.expected_chunk_ids:
+            cid = clean_chunk_id(raw)
+            if cid in valid_chunk_ids and cid not in seen:
+                seen.add(cid)
+                contexts.append({"chunk_id": cid})
+        for name in item.expected_table_names:
+            name = name.strip()
+            if name in valid_table_names and name not in seen:
+                seen.add(name)
+                contexts.append({"table_name": name})
+        return contexts
 
     eval_records = [
         {
             "question": item.question,
             "ground_truth": item.ground_truth,
-            "expected_contexts": [
-                serialize_context(c) for c in item.expected_contexts
-                if c.chunk_id or c.table_name
-            ]
+            "answer_type": item.answer_type,
+            "keywords": (
+                [k.strip() for k in item.keywords if k.strip()]
+                if item.answer_type == "descriptive" else []
+            ),
+            "expected_contexts": build_contexts(item),
         }
         for item in eval_data.items
     ]
@@ -613,6 +663,9 @@ def build_agent(file_path, *, generate_eval=False, role="employee"):
             "child_matches": retrieved_ids,
             "parents": list(seen_parents),
             "redacted": redacted_ids,
+            # the source file's hash (one document per agent); empty when this turn
+            # retrieved nothing (children/chunks are reported in child_matches).
+            "sources": [doc_hash] if visible_docs else [],
         })
 
         serialized = "\n\n".join(
@@ -659,7 +712,7 @@ def build_agent(file_path, *, generate_eval=False, role="employee"):
 
 
 def run_cli(file_path, role="employee"):
-    agent, _, reset_turn = build_agent(file_path, generate_eval=False, role=role)
+    agent, _, reset_turn = build_agent(file_path, generate_eval=True, role=role)
 
     while True:
         user_query = input("\nYou: ")
@@ -687,4 +740,4 @@ if __name__ == "__main__":
     file_name = "data_files/Employee Performance.docx"
     # role controls what the retriever is allowed to surface:
     #   guest -> public, employee -> internal, manager -> confidential
-    run_cli(file_name, role="employee")
+    run_cli(file_name, role="manager")

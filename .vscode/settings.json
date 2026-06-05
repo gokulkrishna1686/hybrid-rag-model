@@ -1,0 +1,9 @@
+{
+  // The app modules live in src/ and import each other as flat top-level modules
+  // (e.g. `from main import build_agent`). Tell Pylance to resolve imports against
+  // src/ so they don't show up as unresolved in the editor.
+  "python.analysis.extraPaths": ["src"],
+
+  // Use the project's virtual environment by default.
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe"
+}
