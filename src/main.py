@@ -8,8 +8,10 @@ from langchain.tools import tool
 from langchain_classic.retrievers import EnsembleRetriever
 from pydantic import BaseModel
 import os
+import sys
 import shutil
 import hashlib
+from pathlib import Path
 from langchain.agents import create_agent
 from langchain.agents.structured_output import ToolStrategy
 from langchain_community.utilities import SQLDatabase
@@ -29,7 +31,24 @@ from extract_tables import extract_tables
 from extract_text import load_text_docs
 from enrich import enrich_text, redact, SENSITIVITY_ORDER, clearance_level
 
-load_dotenv()
+# Windows consoles default to cp1252 and crash when printing non-ASCII characters
+# (e.g. the currency symbols in the eval data). Force UTF-8 so prints never blow up.
+# Every entry point (main / eval / test_eval) imports this module, so this covers them.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except AttributeError:
+    pass
+
+# Anchor everything to the repo root (this file lives in src/), so data, cache, AND the
+# .env file resolve to the SAME place no matter which directory a script is launched
+# from. This is why `python src/main.py` (from root) and `python main.py` (from inside
+# src/) both use the one data_files/, processed/, and .env at the project root.
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data_files"
+PROCESSED_DIR = BASE_DIR / "processed"
+
+load_dotenv(BASE_DIR / ".env")
 api_key = os.getenv("OPENAI_API_KEY")
 
 
@@ -308,7 +327,7 @@ def build_agent(file_path, *, generate_eval=False, role="employee"):
     print(f"Agent role: {role} (clearance level {clearance})")
 
     doc_hash = file_hash(file_path)
-    processed_dir = os.path.join("processed", doc_hash)
+    processed_dir = str(PROCESSED_DIR / doc_hash)
     chunks_path = os.path.join(processed_dir, "chunks.json")
     parents_path = os.path.join(processed_dir, "parents.json")
     image_cache_path = os.path.join(processed_dir, "image_descriptions.json")
@@ -737,7 +756,7 @@ def run_cli(file_path, role="employee"):
 
 
 if __name__ == "__main__":
-    file_name = "data_files/Employee Performance.docx"
+    file_name = str(DATA_DIR / "Employee Performance.docx")
     # role controls what the retriever is allowed to surface:
     #   guest -> public, employee -> internal, manager -> confidential
     run_cli(file_name, role="manager")

@@ -24,7 +24,7 @@ import os
 import random
 import re
 
-from main import build_agent, file_hash
+from main import build_agent, file_hash, PROCESSED_DIR, DATA_DIR
 
 # tables are named "page_X_table_Y", so we can recover which table the SQL agent
 # queried by scanning the SQL it ran for that pattern.
@@ -84,7 +84,7 @@ def run_cli(file_path, role="employee"):
     )
 
     results_path = os.path.join(
-        "processed", file_hash(file_path), "eval_results.json"
+        PROCESSED_DIR, file_hash(file_path), "eval_results.json"
     )
     results = []
 
@@ -114,7 +114,7 @@ def run_eval(file_path, role="employee", k=None):
     Skips entirely if eval_results.json already exists for this file's hash:
     the existing results are loaded and returned — no agent build, no API calls.
     """
-    processed_dir = os.path.join("processed", file_hash(file_path))
+    processed_dir = os.path.join(PROCESSED_DIR, file_hash(file_path))
     eval_path = os.path.join(processed_dir, "eval_dataset.json")
     results_path = os.path.join(processed_dir, "eval_results.json")
 
@@ -154,7 +154,7 @@ def run_eval(file_path, role="employee", k=None):
 
 
 if __name__ == "__main__":
-    file_name = "data_files/Employee Performance.docx"
+    file_name = str(DATA_DIR / "Employee Performance.docx")
     # batch: answer questions from eval_dataset.json and save them to
     # eval_results.json. Skipped automatically if eval_results.json already exists.
     # Pass k=N to answer only a random sample of N questions (default: all).
