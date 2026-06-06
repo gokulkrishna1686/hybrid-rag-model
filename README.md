@@ -126,8 +126,9 @@ LangChain/LangGraph pick up the `LANGSMITH_*` variables automatically — no cod
 
 ## Usage
 
-> Run every command below from the **project root** (not from inside `src/`), so the
-> `data_files/` and `processed/` folders resolve correctly.
+> `data_files/` and `processed/` are anchored to the project root in code, so these
+> commands work no matter which directory you launch them from. The examples assume
+> you're at the project root.
 
 ### Streamlit app
 

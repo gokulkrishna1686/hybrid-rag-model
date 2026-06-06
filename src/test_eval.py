@@ -20,6 +20,7 @@ via eval.run_eval (which itself generates the dataset too if it is missing).
 """
 
 import json
+import math
 import os
 
 from main import build_agent, file_hash, PROCESSED_DIR, DATA_DIR
@@ -78,7 +79,90 @@ def load_eval_data(file_path, role="employee"):
     return eval_dataset, eval_results
 
 
+# --- helpers: pull the IDs out of each side ---------------------------------
+
+def _expected_ids(gold_item):
+    """The relevant context IDs for one question (chunk_ids + table_names)."""
+    ids = set()
+    for ctx in gold_item.get("expected_contexts", []):
+        ids.add(ctx.get("chunk_id") or ctx.get("table_name"))
+    ids.discard(None)
+    return ids
+
+
+def _retrieved_ids(result):
+    """What the system actually retrieved, in rank order: chunks first, then tables."""
+    return list(result.get("chunks_retrieved", [])) + list(result.get("tables_queried", []))
+
+
+def precision_at_k(retrieved, relevant, k=None):
+    top = retrieved[:k] if k else retrieved
+    if not top:
+        return 0.0
+    return len(set(top) & relevant) / len(top)
+
+
+def recall_at_k(retrieved, relevant, k=None):
+    if not relevant:
+        return 0.0
+    top = retrieved[:k] if k else retrieved
+    return len(set(top) & relevant) / len(relevant)
+
+
+def hit_rate_at_k(retrieved, relevant, k=None):
+    top = retrieved[:k] if k else retrieved
+    return 1.0 if (set(top) & relevant) else 0.0
+
+
+def reciprocal_rank(retrieved, relevant):
+    """1 / rank of the first relevant hit (0 if none). MRR is the mean of this."""
+    for rank, item in enumerate(retrieved, start=1):
+        if item in relevant:
+            return 1.0 / rank
+    return 0.0
+
+
+def ndcg_at_k(retrieved, relevant, k=None):
+    cutoff = k if k else len(retrieved)
+    top = retrieved[:cutoff]
+    dcg = sum(1.0 / math.log2(i + 1) for i, item in enumerate(top, start=1) if item in relevant)
+    ideal_n = min(len(relevant), cutoff)
+    idcg = sum(1.0 / math.log2(i + 1) for i in range(1, ideal_n + 1))
+    return dcg / idcg if idcg else 0.0
+
+
+# --- aggregate over the whole set -------------------------------------------
+
+def retrieval_evaluation(validation_set, eval_results, k=None):
+    """Average the 5 retrieval metrics over every aligned question.
+
+    validation_set[i] -> gold item (expected_contexts)
+    eval_results[i]   -> prediction (chunks_retrieved + tables_queried)
+    k: top-k cutoff (None = use everything retrieved).
+    """
+    totals = {"precision": 0.0, "recall": 0.0, "hit_rate": 0.0, "mrr": 0.0, "ndcg": 0.0}
+    scored = 0
+
+    for i in validation_set.keys() & eval_results.keys():
+        relevant = _expected_ids(validation_set[i])
+        if not relevant:                       # no gold context -> can't score retrieval
+            continue
+        retrieved = _retrieved_ids(eval_results[i])
+
+        totals["precision"] += precision_at_k(retrieved, relevant, k)
+        totals["recall"]    += recall_at_k(retrieved, relevant, k)
+        totals["hit_rate"]  += hit_rate_at_k(retrieved, relevant, k)
+        totals["mrr"]       += reciprocal_rank(retrieved, relevant)
+        totals["ndcg"]      += ndcg_at_k(retrieved, relevant, k)
+        scored += 1
+
+    if scored == 0:
+        return {m: 0.0 for m in totals}
+    return {m: round(v / scored, 4) for m, v in totals.items()}
+
 if __name__ == "__main__":
     file_name = str(DATA_DIR / "Employee Performance.docx")
     eval_dataset, eval_results = load_eval_data(file_name)
     
+    retrieval_scores = retrieval_evaluation(eval_dataset, eval_results)      # or k=4 for @4
+    print("\nRetrieval Evaluation: ", retrieval_scores)
