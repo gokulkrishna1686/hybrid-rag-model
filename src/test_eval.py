@@ -23,13 +23,14 @@ import json
 import math
 import os
 import hashlib
-from langchain_openai import OpenAIEmbeddings
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from pydantic import BaseModel
 
 from main import build_agent, file_hash, PROCESSED_DIR, DATA_DIR
 from eval import run_eval
 
 
-def load_eval_data(file_path, role="manager"):
+def load_eval_data(file_path, role="manager", results_name="eval_results.json"):
     """Return (eval_dataset, eval_results) for `file_path` as dicts keyed by a shared
     integer index, so eval_dataset[i] and eval_results[i] refer to the same question.
 
@@ -38,10 +39,13 @@ def load_eval_data(file_path, role="manager"):
       - eval_results.json missing -> run_eval makes just the results (reusing the dataset)
     If both exist, nothing is generated (no API calls). If both are missing, run_eval
     creates the dataset and then the results in a single agent build.
+
+    results_name lets you point at an alternate results file (e.g. "eval_results_small.json")
+    without regenerating anything — it must already exist.
     """
     processed_dir = os.path.join(PROCESSED_DIR, file_hash(file_path))
     dataset_path = os.path.join(processed_dir, "eval_dataset.json")
-    results_path = os.path.join(processed_dir, "eval_results.json")
+    results_path = os.path.join(processed_dir, results_name)
 
     have_dataset = os.path.exists(dataset_path)
     have_results = os.path.exists(results_path)
@@ -473,6 +477,211 @@ def print_keyword_failures(validation_set, eval_results, threshold=0.6, file_pat
     return "\n".join(lines)
 
 
+# --- LLM-judge metrics: faithfulness + answer relevancy (RAGAS-style) ------------
+# These call an LLM (gpt-4.1-mini) per question, so they cost tokens — unlike the
+# retrieval/keyword/semantic metrics above. faithfulness needs the retrieved context
+# (reconstructed from chunks_retrieved -> the PARENT text the agent actually saw).
+
+_judge = ChatOpenAI(model="gpt-4.1-mini", temperature=0)
+
+
+class _Claims(BaseModel):
+    claims: list[str]
+
+
+class _Verdicts(BaseModel):
+    verdicts: list[bool]            # one per claim, in the same order
+
+
+class _GenQuestions(BaseModel):
+    questions: list[str]
+    noncommittal: bool             # True if the answer is evasive / "I don't know"
+
+
+_claim_extractor = _judge.with_structured_output(_Claims)
+_claim_judge = _judge.with_structured_output(_Verdicts)
+_question_generator = _judge.with_structured_output(_GenQuestions)
+
+
+def _load_context_maps(file_path):
+    """Maps to rebuild the context the agent saw: child chunk_id -> parent_id, parent_id
+    -> parent text, and child chunk_id -> child text (fallback)."""
+    base = os.path.join(PROCESSED_DIR, file_hash(file_path))
+    with open(os.path.join(base, "chunks.json"), encoding="utf-8") as f:
+        chunks = json.load(f)
+    parents = []
+    parents_path = os.path.join(base, "parents.json")
+    if os.path.exists(parents_path):
+        with open(parents_path, encoding="utf-8") as f:
+            parents = json.load(f)
+    child_to_parent = {c["chunk_id"]: c.get("parent_id") for c in chunks}
+    child_text = {c["chunk_id"]: c.get("text", "") for c in chunks}
+    parent_text = {p["parent_id"]: p.get("text", "") for p in parents}
+    return child_to_parent, child_text, parent_text
+
+
+def _result_context(result, child_to_parent, parent_text, child_text):
+    """The context text the agent retrieved for one result: the unique PARENT chunks behind
+    its chunks_retrieved (children are swapped to parents, deduped), joined together."""
+    parts, seen = [], set()
+    for cid in result.get("chunks_retrieved", []):
+        pid = child_to_parent.get(cid)
+        key = pid or cid
+        if key in seen:
+            continue
+        seen.add(key)
+        parts.append(parent_text.get(pid) or child_text.get(cid) or "")
+    return "\n\n".join(p for p in parts if p)
+
+
+def faithfulness(question, answer, context):
+    """RAGAS faithfulness: fraction of the answer's atomic claims that the CONTEXT supports.
+    Two LLM calls — extract claims, then judge them all at once. Returns None when there
+    are no claims or no context (can't be scored). Range 0..1; 1 = no hallucination."""
+    if not answer or not context:
+        return None
+    claims = _claim_extractor.invoke(
+        "Break the ANSWER into a list of atomic factual claims it asserts (each a short, "
+        "standalone statement). Include only claims the answer actually states.\n\n"
+        f"QUESTION: {question}\nANSWER: {answer}"
+    ).claims
+    if not claims:
+        return None
+    numbered = "\n".join(f"{n}. {c}" for n, c in enumerate(claims, 1))
+    verdicts = _claim_judge.invoke(
+        "For EACH claim decide if it can be inferred SOLELY from the context (true) or not "
+        "(false). Use only the context, not outside knowledge. Return one verdict per claim "
+        f"in the same order.\n\nCONTEXT:\n{context}\n\nCLAIMS:\n{numbered}"
+    ).verdicts[:len(claims)]
+    if not verdicts:
+        return 0.0
+    return sum(1 for v in verdicts if v) / len(claims)
+
+
+def answer_relevancy(question, answer, n=3, cache=None):
+    """RAGAS answer relevancy: generate n questions the ANSWER would answer, then return the
+    mean cosine similarity between the original question and those generated ones. 0 if the
+    answer is noncommittal/evasive. One LLM call + (batched) embeddings."""
+    if cache is None:
+        cache = {}
+    if not answer:
+        return 0.0
+    gen = _question_generator.invoke(
+        f"Generate {n} distinct questions that the ANSWER below would correctly and fully "
+        "answer. Set noncommittal=true if the answer is evasive or admits it doesn't know.\n"
+        f"ANSWER: {answer}"
+    )
+    if gen.noncommittal or not gen.questions:
+        return 0.0
+    vecs = _embed_many_cached([question] + list(gen.questions), cache)
+    q_vec, gen_vecs = vecs[0], vecs[1:]
+    return sum(cosine_similarity(q_vec, gv) for gv in gen_vecs) / len(gen_vecs)
+
+
+def faithfulness_evaluation(validation_set, eval_results, file_path):
+    """Average faithfulness over questions that retrieved chunk context (table-only
+    questions have no chunk context to check, so they're skipped). Returns
+    {"faithfulness", "n_questions", "per_item": {i: score}}."""
+    child_to_parent, child_text, parent_text = _load_context_maps(file_path)
+    total, scored, per_item = 0.0, 0, {}
+    for i in sorted(validation_set.keys() & eval_results.keys()):
+        context = _result_context(eval_results[i], child_to_parent, parent_text, child_text)
+        if not context:
+            continue
+        score = faithfulness(validation_set[i].get("question", ""),
+                             eval_results[i].get("response", ""), context)
+        if score is None:
+            continue
+        per_item[i] = round(score, 4)
+        total += score
+        scored += 1
+    avg = round(total / scored, 4) if scored else 0.0
+    return {"faithfulness": avg, "n_questions": scored, "per_item": per_item}
+
+
+def answer_relevancy_evaluation(validation_set, eval_results, file_path, n=3):
+    """Average answer relevancy over every aligned question. Reuses the per-file embedding
+    cache. Returns {"answer_relevancy", "n_questions", "per_item": {i: score}}."""
+    cache_path = _embeddings_cache_path(file_path)
+    cache = _load_cache(cache_path)
+    n_before = len(cache)
+    total, scored, per_item = 0.0, 0, {}
+    for i in sorted(validation_set.keys() & eval_results.keys()):
+        answer = eval_results[i].get("response", "")
+        if not answer:
+            continue
+        score = answer_relevancy(validation_set[i].get("question", ""), answer, n, cache)
+        per_item[i] = round(score, 4)
+        total += score
+        scored += 1
+    if len(cache) > n_before:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    avg = round(total / scored, 4) if scored else 0.0
+    return {"answer_relevancy": avg, "n_questions": scored, "per_item": per_item}
+
+
+def _format_llm_metrics(data):
+    """Readable text block from an llm-metrics dict (freshly computed or loaded cache)."""
+    faith, relev = data["faithfulness"], data["answer_relevancy"]
+    questions = data.get("questions", {})
+    lines = [f"LLM-judge metrics on {data.get('results_file', '?')} "
+             f"({faith.get('n_questions', 0)} questions)",
+             f"\n  Faithfulness     (avg): {faith.get('faithfulness')}",
+             f"  Answer Relevancy (avg): {relev.get('answer_relevancy')}",
+             "\n  Per question:"]
+    f_items, r_items = faith.get("per_item", {}), relev.get("per_item", {})
+    for k in sorted(set(f_items) | set(r_items), key=int):
+        lines.append(f"    Q{k}  faithfulness={f_items.get(k, '-')}  "
+                     f"answer_relevancy={r_items.get(k, '-')}")
+        q = questions.get(str(k))
+        if q:
+            lines.append(f"        {q[:75]}")
+    return "\n".join(lines)
+
+
+def run_llm_metrics(file_path, results_name="eval_results.json", n=3):
+    """Faithfulness + answer relevancy for `results_name`, CACHED to a json so re-runs make
+    ZERO API calls (the LLM-judge calls only happen the first time). Also writes a readable
+    txt. Cache files: processed/<hash>/<stem>_llm_metrics.{json,txt} where stem is derived
+    from results_name (eval_results.json -> eval, eval_results_small.json -> eval_small).
+    Delete the json to force a recompute (e.g. after regenerating eval_results)."""
+    base = os.path.join(PROCESSED_DIR, file_hash(file_path))
+    stem = results_name.rsplit(".", 1)[0].replace("eval_results", "eval")
+    json_path = os.path.join(base, f"{stem}_llm_metrics.json")
+    txt_path = os.path.join(base, f"{stem}_llm_metrics.txt")
+
+    if os.path.exists(json_path):                      # already computed -> no API calls
+        print(f"{stem}_llm_metrics.json present -> loading (no API calls)")
+        with open(json_path, encoding="utf-8") as f:
+            data = json.load(f)
+        print(_format_llm_metrics(data))
+        return data
+
+    ds, res = load_eval_data(file_path, results_name=results_name)
+    faith = faithfulness_evaluation(ds, res, file_path)
+    relev = answer_relevancy_evaluation(ds, res, file_path, n=n)
+    # json object keys must be strings; normalize per_item so reload matches compute
+    faith["per_item"] = {str(k): v for k, v in faith["per_item"].items()}
+    relev["per_item"] = {str(k): v for k, v in relev["per_item"].items()}
+    data = {
+        "document": file_path,
+        "results_file": results_name,
+        "faithfulness": faith,
+        "answer_relevancy": relev,
+        "questions": {str(i): ds[i]["question"] for i in ds},
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    text = _format_llm_metrics(data)
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(text + "\n")
+    print(text)
+    print(f"\nSaved -> {json_path}\nSaved -> {txt_path}")
+    return data
+
+
 if __name__ == "__main__":
     file_name = str(DATA_DIR / "biology.pdf")
     eval_dataset, eval_results = load_eval_data(file_name)
@@ -504,3 +713,8 @@ if __name__ == "__main__":
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(report) + "\n")
     print(f"\nSaved report -> {report_path}")
+
+    # LLM-judge metrics (faithfulness + answer relevancy) for the full set.
+    # CACHED: the first run computes + saves; every run after loads with NO API calls.
+    print("\n========== LLM-JUDGE METRICS ==========")
+    run_llm_metrics(file_name)
