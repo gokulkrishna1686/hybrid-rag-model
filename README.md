@@ -10,6 +10,13 @@ The three retrieval paths:
 
 Text, image captions, and tables are all extracted from the uploaded file, and the agent decides which path to use per question.
 
+## Documentation
+
+Deep-dive references — concepts, formulas, and the workflow:
+
+- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — pipeline + retrieval math: parent–child chunking, BM25, dense similarity, and the RRF re-ranking.
+- **[docs/EVALUATION.md](docs/EVALUATION.md)** — evaluation math: retrieval metrics (precision/recall/MRR/NDCG), semantic similarity, keyword coverage, faithfulness, answer relevancy, and the ablation.
+
 ## How it works
 
 When a file is processed (`build_agent` in `main.py`), the pipeline:
@@ -87,7 +94,7 @@ src/                  # all application + eval code (run scripts from the projec
   test_eval.py        # Loads eval_dataset.json + eval_results.json as dicts for scoring
 notebooks/            # Exploratory notebooks (BM25/Chroma, table extraction)
 scratch/              # Scratch experiments, not used by the app
-docs/                 # Project notes (TODO.md)
+docs/                 # Deep-dive docs (ARCHITECTURE.md, EVALUATION.md) + TODO.md
 requirements.txt      # Pinned dependencies
 processed/            # Per-file cache (gitignored)
 data_files/           # Local documents (gitignored)

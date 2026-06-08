@@ -682,39 +682,73 @@ def run_llm_metrics(file_path, results_name="eval_results.json", n=3):
     return data
 
 
+def run_all_evaluations(file_path, results_name="eval_results.json", n=3):
+    """Run EVERY evaluation for one results file and aggregate them into a single report:
+    retrieval, semantic similarity, keyword coverage (exact + fuzzy), keyword failures, and
+    the LLM-judge metrics (faithfulness + answer relevancy). Prints a readable summary and
+    saves it to processed/<hash>/eval_report.{json,txt}. Returns the aggregate dict.
+
+    Cost: the cheap metrics recompute each call but reuse the embedding cache (~no API);
+    the LLM-judge metrics load from their own json cache after the first run (zero API).
+    """
+    ds, res = load_eval_data(file_path, results_name=results_name)
+
+    retrieval = retrieval_evaluation(ds, res)
+    semantic = semantic_evaluation(ds, res, file_path)
+    keyword_exact = keyword_evaluation(ds, res)
+    keyword_fuzzy = keyword_evaluation(ds, res, fuzzy=True, file_path=file_path)
+
+    summary_text = "\n".join([
+        f"Document: {file_path}",
+        f"Results file: {results_name}",
+        f"Questions evaluated: {len(ds)}",
+        "\n================== METRICS ==================",
+        f"  Retrieval        : {retrieval}",
+        f"  Semantic         : {semantic}",
+        f"  Keyword (exact)  : {keyword_exact}",
+        f"  Keyword (fuzzy)  : {keyword_fuzzy}",
+    ])
+    print(summary_text)
+
+    # LLM-judge metrics (cached) — run_llm_metrics prints its own block
+    print("\n========== LLM-JUDGE METRICS ==========")
+    llm = run_llm_metrics(file_path, results_name=results_name, n=n)
+
+    # keyword failures with ground-truth + LLM answer — prints its own block
+    failures_text = print_keyword_failures(ds, res, file_path=file_path)
+
+    aggregate = {
+        "document": file_path,
+        "results_file": results_name,
+        "questions_evaluated": len(ds),
+        "retrieval": retrieval,
+        "semantic": semantic,
+        "keyword_exact": keyword_exact,
+        "keyword_fuzzy": keyword_fuzzy,
+        "faithfulness": llm["faithfulness"],
+        "answer_relevancy": llm["answer_relevancy"],
+    }
+
+    report_text = "\n".join([
+        summary_text,
+        "\n========== LLM-JUDGE METRICS ==========",
+        _format_llm_metrics(llm),
+        failures_text,
+    ])
+
+    base = os.path.join(PROCESSED_DIR, file_hash(file_path))
+    json_path = os.path.join(base, "eval_report.json")
+    txt_path = os.path.join(base, "eval_report.txt")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(aggregate, f, indent=2, ensure_ascii=False)
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(report_text + "\n")
+
+    print(f"\nSaved aggregate -> {json_path}")
+    print(f"Saved aggregate -> {txt_path}")
+    return aggregate
+
+
 if __name__ == "__main__":
     file_name = str(DATA_DIR / "biology.pdf")
-    eval_dataset, eval_results = load_eval_data(file_name)
-
-    # collect everything into one readable report (printed AND saved to disk)
-    report = []
-    def out(s=""):
-        print(s)
-        report.append(s)
-
-    retrieval_scores = retrieval_evaluation(eval_dataset, eval_results)
-    semantic_scores = semantic_evaluation(eval_dataset, eval_results, file_name)
-    keyword_exact = keyword_evaluation(eval_dataset, eval_results)
-    keyword_fuzzy = keyword_evaluation(eval_dataset, eval_results, fuzzy=True,
-                                       file_path=file_name)
-
-    out(f"Document: {file_name}")
-    out(f"Questions evaluated: {len(eval_dataset)}")
-    out("\n================== METRICS ==================")
-    out(f"  Retrieval        : {retrieval_scores}")
-    out(f"  Semantic         : {semantic_scores}")
-    out(f"  Keyword (exact)  : {keyword_exact}")
-    out(f"  Keyword (fuzzy)  : {keyword_fuzzy}")
-
-    # keyword failures with ground-truth + LLM answer (this prints on its own too)
-    report.append(print_keyword_failures(eval_dataset, eval_results, file_path=file_name))
-
-    report_path = os.path.join(PROCESSED_DIR, file_hash(file_name), "eval_report.txt")
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(report) + "\n")
-    print(f"\nSaved report -> {report_path}")
-
-    # LLM-judge metrics (faithfulness + answer relevancy) for the full set.
-    # CACHED: the first run computes + saves; every run after loads with NO API calls.
-    print("\n========== LLM-JUDGE METRICS ==========")
-    run_llm_metrics(file_name)
+    run_all_evaluations(file_name)
