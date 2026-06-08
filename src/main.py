@@ -16,6 +16,7 @@ from langchain.agents import create_agent
 from langchain.agents.structured_output import ToolStrategy
 from langchain_community.utilities import SQLDatabase
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 import json
 import random
 import re
@@ -146,25 +147,65 @@ def split_parent_child(
     return children, parents_by_id
 
 
+class _EvalItem(BaseModel):
+    question: str
+    ground_truth: str
+    answer_type: Literal["literal", "descriptive"]
+    keywords: list[str] = []
+    expected_chunk_ids: list[str] = []
+    expected_table_names: list[str] = []
+
+
+class _EvalDataset(BaseModel):
+    items: list[_EvalItem]
+
+
+def _sanitize_eval_records(items, valid_chunk_ids, valid_table_names):
+    """Turn raw LLM _EvalItems into clean eval_dataset records: recover garbled ids
+    (e.g. "chunk_7'}]"), drop references that don't actually exist, and keep keywords
+    only for descriptive answers. Shared by the full generator and the keyword pass."""
+    def clean_chunk_id(raw):
+        match = re.search(r"chunk_\d+", raw)
+        return match.group(0) if match else None
+
+    def build_contexts(item):
+        contexts = []
+        seen = set()
+        for raw in item.expected_chunk_ids:
+            cid = clean_chunk_id(raw)
+            if cid in valid_chunk_ids and cid not in seen:
+                seen.add(cid)
+                contexts.append({"chunk_id": cid})
+        for name in item.expected_table_names:
+            name = name.strip()
+            if name in valid_table_names and name not in seen:
+                seen.add(name)
+                contexts.append({"table_name": name})
+        return contexts
+
+    return [
+        {
+            "question": item.question,
+            "ground_truth": item.ground_truth,
+            "answer_type": item.answer_type,
+            "keywords": (
+                [k.strip() for k in item.keywords if k.strip()]
+                if item.answer_type == "descriptive" else []
+            ),
+            "expected_contexts": build_contexts(item),
+        }
+        for item in items
+    ]
+
+
 def _generate_eval_dataset(eval_path, chunk_records, table_metadata, db):
     print("Generating eval dataset (LLM)...")
-
-    class EvalItem(BaseModel):
-        question: str
-        ground_truth: str
-        answer_type: Literal["literal", "descriptive"]
-        keywords: list[str] = []
-        expected_chunk_ids: list[str] = []
-        expected_table_names: list[str] = []
-
-    class EvalDataset(BaseModel):
-        items: list[EvalItem]
 
     eval_llm = ChatOpenAI(
         model="gpt-4.1-mini",
         temperature=0.3,
         api_key=api_key,
-    ).with_structured_output(EvalDataset)
+    ).with_structured_output(_EvalDataset)
 
     random.seed(42)
 
@@ -275,53 +316,141 @@ Tables (SQLite schema + sample rows):
 
     eval_data = eval_llm.invoke(eval_prompt)
 
-    # sanitize: recover the bare id if the model garbled it (e.g. "chunk_7'}]},{")
-    # and keep only references that actually exist in the chunks/tables.
+    # recover garbled ids, keep only references that actually exist in the chunks/tables
     valid_chunk_ids = {rec["chunk_id"] for rec in eval_chunks}
     valid_table_names = (
         {m["table_name"] for m in table_metadata} if table_metadata else set()
     )
-
-    def clean_chunk_id(raw):
-        match = re.search(r"chunk_\d+", raw)
-        return match.group(0) if match else None
-
-    def build_contexts(item):
-        contexts = []
-        seen = set()
-        for raw in item.expected_chunk_ids:
-            cid = clean_chunk_id(raw)
-            if cid in valid_chunk_ids and cid not in seen:
-                seen.add(cid)
-                contexts.append({"chunk_id": cid})
-        for name in item.expected_table_names:
-            name = name.strip()
-            if name in valid_table_names and name not in seen:
-                seen.add(name)
-                contexts.append({"table_name": name})
-        return contexts
-
-    eval_records = [
-        {
-            "question": item.question,
-            "ground_truth": item.ground_truth,
-            "answer_type": item.answer_type,
-            "keywords": (
-                [k.strip() for k in item.keywords if k.strip()]
-                if item.answer_type == "descriptive" else []
-            ),
-            "expected_contexts": build_contexts(item),
-        }
-        for item in eval_data.items
-    ]
+    eval_records = _sanitize_eval_records(
+        eval_data.items, valid_chunk_ids, valid_table_names
+    )
 
     with open(eval_path, "w", encoding="utf-8") as f:
         json.dump(eval_records, f, indent=4, ensure_ascii=False)
     print(f"Eval dataset saved to {eval_path}")
 
 
-def build_agent(file_path, *, generate_eval=False, role="employee"):
-    """Process a file (pdf/docx/pptx, with caching) and return a ready-to-use agent."""
+def generate_keyword_questions(file_path, n=6):
+    """Append N exact-token / keyword questions to eval_dataset.json — the case BM25 is
+    meant to win: a rare LITERAL token (an ID, code, label, version, model number, proper
+    noun) that dense embeddings blur but keyword search nails. The base set skews semantic,
+    so these balance it and make a retrieval weight sweep trustworthy.
+
+    Existing questions are preserved; duplicates (same question text) are skipped. Reads
+    the cached chunks.json for the file's hash; eval_dataset.json must already exist.
+    Returns the list of newly added records.
+    """
+    doc_hash = file_hash(file_path)
+    processed_dir = str(PROCESSED_DIR / doc_hash)
+    chunks_path = os.path.join(processed_dir, "chunks.json")
+    eval_path = os.path.join(processed_dir, "eval_dataset.json")
+
+    with open(chunks_path, "r", encoding="utf-8") as f:
+        chunk_records = json.load(f)
+
+    chunks_context = "\n\n".join(
+        f"[{rec['chunk_id']}] {rec['text']}" for rec in chunk_records
+    )
+    valid_chunk_ids = {rec["chunk_id"] for rec in chunk_records}
+
+    eval_llm = ChatOpenAI(
+        model="gpt-4.1-mini",
+        temperature=0.3,
+        api_key=api_key,
+    ).with_structured_output(_EvalDataset)
+
+    prompt = f"""You are adding KEYWORD / EXACT-TOKEN questions to an evaluation set for a
+hybrid RAG system. These specifically stress the BM25 (keyword) retriever, NOT the dense
+semantic retriever.
+
+Generate exactly {n} questions. EVERY question must hinge on a RARE, LITERAL token that
+appears VERBATIM in only one (or very few) chunk(s) — an identifier, code, label, version
+string, model/part number, room name, or other proper noun (e.g. "R-14", "UPS-Secondary",
+"ISO 27001", "Orion Hall", "v3.2", "Dell PowerEdge").
+
+Rules for EACH question:
+- answer_type MUST be "literal". keywords MUST be an empty list.
+- The question MUST contain the exact rare token, spelled exactly as it appears in the
+  chunk, and must be answerable from that token's chunk alone.
+- ground_truth is the exact value/answer (a short phrase, number, name, or code).
+- Strongly PREFER opaque tokens (codes, IDs, labels, model/part numbers, version strings)
+  over ordinary words — those are what dense embeddings struggle with and BM25 excels at.
+- expected_chunk_ids: the single chunk_id whose text literally contains that token. Copy
+  the exact id from inside the [square brackets] below. expected_table_names MUST be empty.
+- Do NOT invent facts. Spread the questions across DIFFERENT chunks. No duplicates.
+
+Chunks:
+{chunks_context}
+"""
+
+    print(f"Generating {n} keyword/exact-token question(s) (LLM)...")
+    eval_data = eval_llm.invoke(prompt)
+    new_records = _sanitize_eval_records(eval_data.items, valid_chunk_ids, set())
+
+    # defensive: keep only literal, chunk-grounded items (drop anything the model
+    # mislabeled or that lost its chunk reference during sanitization)
+    new_records = [
+        r for r in new_records
+        if r["answer_type"] == "literal"
+        and any("chunk_id" in c for c in r["expected_contexts"])
+    ]
+
+    with open(eval_path, "r", encoding="utf-8") as f:
+        existing = json.load(f)
+    existing_questions = {r["question"] for r in existing}
+    added = [r for r in new_records if r["question"] not in existing_questions]
+
+    with open(eval_path, "w", encoding="utf-8") as f:
+        json.dump(existing + added, f, indent=4, ensure_ascii=False)
+
+    print(f"Added {len(added)} keyword question(s) -> {eval_path} "
+          f"(was {len(existing)}, now {len(existing) + len(added)})")
+    return added
+
+
+class _CachingEmbeddings(Embeddings):
+    """Wraps an embeddings backend and memoizes embed_query: the same query string is
+    embedded once, then served from a dict. Harmless for the live agent (queries rarely
+    repeat in a session) but a big saving for tools that re-issue the same queries — e.g.
+    the ablation weight-sweep that re-runs every question across many fusion weights.
+
+    If cache_path is given, the query cache is also PERSISTED to disk (loaded on init,
+    written on each new query) — so a tool like the ablation embeds each question only the
+    very first time it is ever run, and makes ZERO embedding calls on every run after that.
+    embed_documents passes straight through (build-time work, no repeats)."""
+
+    def __init__(self, base, cache_path=None):
+        self._base = base
+        self._cache_path = cache_path
+        self._query_cache = {}
+        if cache_path and os.path.exists(cache_path):
+            try:
+                with open(cache_path, encoding="utf-8") as f:
+                    self._query_cache = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                self._query_cache = {}
+
+    def embed_documents(self, texts):
+        return self._base.embed_documents(texts)
+
+    def embed_query(self, text):
+        if text not in self._query_cache:
+            self._query_cache[text] = self._base.embed_query(text)
+            if self._cache_path:                       # persist so re-runs are free
+                os.makedirs(os.path.dirname(self._cache_path), exist_ok=True)
+                with open(self._cache_path, "w", encoding="utf-8") as f:
+                    json.dump(self._query_cache, f)
+        return self._query_cache[text]
+
+
+def build_agent(file_path, *, generate_eval=False, role="employee", _exports=None,
+                query_cache_path=None):
+    """Process a file (pdf/docx/pptx, with caching) and return a ready-to-use agent.
+
+    _exports: optional dict — if given, the raw retrievers (bm25/semantic/hybrid) and
+    chunks are stashed into it before returning, WITHOUT changing the public return
+    tuple. build_retrievers() uses this so a retrieval ablation tests the exact same
+    objects the agent uses (one source of truth for k / weights / fusion)."""
     # RBAC: the caller's role decides the clearance the retriever enforces.
     clearance = clearance_level(role)
     print(f"Agent role: {role} (clearance level {clearance})")
@@ -353,9 +482,9 @@ def build_agent(file_path, *, generate_eval=False, role="employee"):
         sample_rows_in_table_info=0
     )
 
-    embeddings = OpenAIEmbeddings(
-        model="text-embedding-3-small",
-        api_key=api_key
+    embeddings = _CachingEmbeddings(
+        OpenAIEmbeddings(model="text-embedding-3-small", api_key=api_key),
+        cache_path=query_cache_path,
     )
 
     if os.path.exists(chunks_path) and os.path.exists(chroma_path) and os.path.exists(parents_path):
@@ -725,9 +854,43 @@ def build_agent(file_path, *, generate_eval=False, role="employee"):
         """Reset the per-turn retrieve_context guard. Call before each invoke."""
         turn_state["calls"] = 0
 
+    # optional: hand back the raw retrievers (for ablations) without changing the
+    # public return signature — see build_retrievers() below.
+    if _exports is not None:
+        _exports.update({
+            "bm25_retriever": bm25_retriever,
+            "semantic_retriever": semantic_retriever,
+            "hybrid_retriever": hybrid_retriever,
+            "chunks": chunks,
+        })
+
     # retrieval_log is shared by reference with retrieve_context so a caller can
     # read each turn's scores. reset_turn() MUST be called before every invoke.
     return agent, retrieval_log, reset_turn
+
+
+def build_retrievers(file_path, role="employee", query_cache_path=None):
+    """Build (and return) the SAME three retrievers the agent uses, for retrieval
+    ablations: {"bm25_retriever", "semantic_retriever", "hybrid_retriever", "chunks"}.
+
+    Reuses build_agent so chunking, embeddings, k, and the RRF fusion weights stay a
+    single source of truth (no drift from the live pipeline). No agent.invoke() / LLM
+    calls happen here — only the cached index is loaded and the retrievers constructed.
+    role is accepted for symmetry but does NOT affect raw retriever output (RBAC
+    redaction lives in retrieve_context, not in the retrievers themselves).
+
+    Query embeddings are persisted to processed/<hash>/query_embeddings.json by default,
+    so the first ablation run embeds each question once and every later run makes ZERO
+    embedding calls. Pass query_cache_path="" to disable persistence.
+    """
+    if query_cache_path is None:
+        query_cache_path = os.path.join(
+            PROCESSED_DIR, file_hash(file_path), "query_embeddings.json"
+        )
+    exports = {}
+    build_agent(file_path, generate_eval=False, role=role, _exports=exports,
+                query_cache_path=query_cache_path or None)
+    return exports
 
 
 def run_cli(file_path, role="employee"):
