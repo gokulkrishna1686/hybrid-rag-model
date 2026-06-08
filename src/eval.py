@@ -24,7 +24,8 @@ import os
 import random
 import re
 
-from main import build_agent, file_hash, PROCESSED_DIR, DATA_DIR
+from agent import build_agent
+from config import file_hash, PROCESSED_DIR, DATA_DIR
 
 # tables are named "page_X_table_Y", so we can recover which table the SQL agent
 # queried by scanning the SQL it ran for that pattern.

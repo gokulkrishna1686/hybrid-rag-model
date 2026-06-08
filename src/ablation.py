@@ -20,7 +20,8 @@ import os
 
 from langchain_classic.retrievers import EnsembleRetriever
 
-from main import build_retrievers, file_hash, PROCESSED_DIR, DATA_DIR
+from agent import build_retrievers
+from config import file_hash, PROCESSED_DIR, DATA_DIR
 from test_eval import retrieval_evaluation
 
 

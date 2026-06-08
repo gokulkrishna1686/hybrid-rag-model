@@ -3,7 +3,7 @@ import tempfile
 
 import streamlit as st
 
-from main import build_agent
+from agent import build_agent
 from enrich import ROLE_CLEARANCE
 
 

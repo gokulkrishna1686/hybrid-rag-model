@@ -19,7 +19,7 @@ Deep-dive references — concepts, formulas, and the workflow:
 
 ## How it works
 
-When a file is processed (`build_agent` in `main.py`), the pipeline:
+When a file is processed (`build_agent` in `agent.py`), the pipeline:
 
 1. **Loads text** (`extract_text.py`) per file type — `PyPDFLoader` for PDF, `python-docx` for DOCX, `python-pptx` for PPTX (one document per slide).
 2. **Parent–child chunking** (`split_parent_child`): text is split into large **parent** chunks (2000 chars / 200 overlap) and small **child** chunks (400 / 50). Children are what get embedded and BM25-indexed (precise matching); at query time each matched child is swapped back to its **parent** before being handed to the LLM (richer context). See [Parent–child retrieval](#parentchild-retrieval).
@@ -84,14 +84,24 @@ When `generate_eval=True`, an LLM generates a mixed evaluation set — keyword, 
 
 ```
 src/                  # all application + eval code (run scripts from the project root)
-  main.py             # Pipeline + agent (build_agent), RBAC enforcement, CLI entry point
+  main.py             # CLI entry point (chat loop) + public-API re-exports
+  config.py           # Paths, tunable constants, the agent system prompt, file_hash
+  agent.py            # build_agent / build_retrievers: assembles retrievers + tools + model
+  pipeline.py         # Document ingestion + per-file caching -> chunks / parents / vectors / tables
+  chunking.py         # Parent-child text splitting
+  embeddings.py       # CachingEmbeddings (memoized, optionally disk-persisted embeddings)
+  retrievers.py       # BM25 + dense + RRF-fused hybrid retriever; per-query score breakdown
+  rbac.py             # Clearance enforcement (redact above clearance) + context serialization
+  tools.py            # Agent tools: retrieve_context, get_table_metadata, query_pdf_tables
   enrich.py           # spaCy NER + Presidio PII -> sensitivity tiers + role→clearance map
+  eval_dataset.py     # LLM generation of the evaluation dataset
   extract_text.py     # Multi-format text loading (PDF / DOCX / PPTX)
   extract_images.py   # Image extraction (PyMuPDF / zip) + GPT-4o vision captioning
   extract_tables.py   # Table extraction (pdfplumber) into SQLite
   streamlit_app.py    # Streamlit chat UI: upload, role selector, retrieval-scores panel
   eval.py             # Eval runner (batch/interactive) -> processed/<hash>/eval_results.json
-  test_eval.py        # Loads eval_dataset.json + eval_results.json as dicts for scoring
+  test_eval.py        # Eval metrics (retrieval / semantic / keyword / faithfulness / relevancy)
+  ablation.py         # Retrieval ablation: BM25 vs dense vs hybrid + fusion-weight sweep
 notebooks/            # Exploratory notebooks (BM25/Chroma, table extraction)
 scratch/              # Scratch experiments, not used by the app
 docs/                 # Deep-dive docs (ARCHITECTURE.md, EVALUATION.md) + TODO.md

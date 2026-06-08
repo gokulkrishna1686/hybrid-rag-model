@@ -1,7 +1,7 @@
 """Load (or build) a document's eval dataset and eval results as two dicts.
 
 Usage:
-    from main import DATA_DIR
+    from config import DATA_DIR
     from test_eval import load_eval_data
     eval_dataset, eval_results = load_eval_data(DATA_DIR / "Employee Performance.docx")
 
@@ -26,7 +26,8 @@ import hashlib
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from pydantic import BaseModel
 
-from main import build_agent, file_hash, PROCESSED_DIR, DATA_DIR
+from agent import build_agent
+from config import file_hash, PROCESSED_DIR, DATA_DIR
 from eval import run_eval
 
 
