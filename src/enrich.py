@@ -12,7 +12,7 @@ Everything runs locally and is free (no API calls).
 
 import spacy
 
-from presidio_analyzer import AnalyzerEngine
+from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_anonymizer import AnonymizerEngine
 
@@ -36,6 +36,17 @@ analyzer = AnalyzerEngine(
     nlp_engine=_provider.create_engine(),
     supported_languages=["en"],
 )
+
+# Presidio's default recognizers (with the small model) miss dashed SSN / ID numbers
+# like 123-45-6789, which would otherwise survive redaction. Add an explicit pattern so
+# they are both classified (-> confidential) AND masked by redact().
+analyzer.registry.add_recognizer(PatternRecognizer(
+    supported_entity="US_SSN",
+    name="dashed_ssn_recognizer",
+    patterns=[Pattern(name="ssn_dashed", regex=r"\b\d{3}-\d{2}-\d{4}\b", score=0.85)],
+    context=["ssn", "social security", "identification number"],
+))
+
 anonymizer = AnonymizerEngine()
 
 

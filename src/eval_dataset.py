@@ -12,7 +12,7 @@ from typing import Literal
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
-from config import api_key, CHAT_MODEL, EVAL_TEMPERATURE, PROCESSED_DIR, file_hash
+from config import api_key as DEFAULT_OPENAI_KEY, CHAT_MODEL, EVAL_TEMPERATURE, PROCESSED_DIR, file_hash
 
 
 class _EvalItem(BaseModel):
@@ -66,13 +66,13 @@ def _sanitize_eval_records(items, valid_chunk_ids, valid_table_names):
     ]
 
 
-def generate_eval_dataset(eval_path, chunk_records, table_metadata, db):
+def generate_eval_dataset(eval_path, chunk_records, table_metadata, db, api_key=None):
     print("Generating eval dataset (LLM)...")
 
     eval_llm = ChatOpenAI(
         model=CHAT_MODEL,
         temperature=EVAL_TEMPERATURE,
-        api_key=api_key,
+        api_key=api_key or DEFAULT_OPENAI_KEY,
     ).with_structured_output(_EvalDataset)
 
     random.seed(42)
@@ -198,7 +198,7 @@ Tables (SQLite schema + sample rows):
     print(f"Eval dataset saved to {eval_path}")
 
 
-def generate_keyword_questions(file_path, n=6):
+def generate_keyword_questions(file_path, n=6, api_key=None):
     """Append N exact-token / keyword questions to eval_dataset.json — the case BM25 is
     meant to win: a rare LITERAL token (an ID, code, label, version, model number, proper
     noun) that dense embeddings blur but keyword search nails. The base set skews semantic,
@@ -224,7 +224,7 @@ def generate_keyword_questions(file_path, n=6):
     eval_llm = ChatOpenAI(
         model=CHAT_MODEL,
         temperature=EVAL_TEMPERATURE,
-        api_key=api_key,
+        api_key=api_key or DEFAULT_OPENAI_KEY,
     ).with_structured_output(_EvalDataset)
 
     prompt = f"""You are adding KEYWORD / EXACT-TOKEN questions to an evaluation set for a

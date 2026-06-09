@@ -150,12 +150,13 @@ LangChain/LangGraph pick up the `LANGSMITH_*` variables automatically — no cod
 ### Streamlit app
 
 ```powershell
-streamlit run src/streamlit_app.py
+# run with the venv's Python so spaCy/Presidio resolve (a global `streamlit` won't have them)
+.\.venv\Scripts\python.exe -m streamlit run src/streamlit_app.py
 ```
 
-Upload a PDF/DOCX/PPTX in the sidebar, pick an **access level** (`guest` / `employee` / `manager`), wait for processing, then ask questions. The right-hand panel shows the retrieval scores and which parents were redacted for the current role. Changing the role rebuilds the agent with the new clearance.
+Paste your own **OpenAI API key** in the sidebar (used only for your session and billed to your account — never written to disk), choose the **built-in demo** (`Tier Demo.docx`) or upload your own PDF/DOCX/PPTX, pick an **access level** (`guest` / `employee` / `manager`), then ask questions. The right-hand panel shows the retrieval scores and which parents were redacted for the current role. Changing the role rebuilds the agent with the new clearance.
 
-> Try `data_files/Tier Demo.docx` (a doc with one section per sensitivity tier): ask the same question as `guest` vs `manager` to watch redaction kick in.
+> Pick the built-in **Tier Demo.docx** (a doc with one section per sensitivity tier) and ask the same question as `guest` vs `manager` to watch redaction kick in.
 
 ### Command line
 
@@ -163,7 +164,7 @@ Upload a PDF/DOCX/PPTX in the sidebar, pick an **access level** (`guest` / `empl
 python src/main.py
 ```
 
-By default it loads `data_files/Employee Performance.docx` as `role="employee"` — edit the `file_name` / `role` at the bottom of `src/main.py`. Type `exit`, `quit`, or `bye` to leave.
+By default it loads `data_files/Employee Performance.docx` as `role="manager"` — edit the `file_name` / `role` at the bottom of `src/main.py`. Type `exit`, `quit`, or `bye` to leave.
 
 ## Dev container
 

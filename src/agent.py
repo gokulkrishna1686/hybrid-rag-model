@@ -10,7 +10,7 @@ from langchain.agents import create_agent
 from langchain.agents.structured_output import ToolStrategy
 
 from config import (
-    api_key,
+    api_key as DEFAULT_OPENAI_KEY,
     CHAT_MODEL,
     EMBED_MODEL,
     AGENT_TEMPERATURE,
@@ -31,13 +31,17 @@ class ResponseFormat(BaseModel):
     message: str
 
 
-def build_agent(file_path, *, generate_eval=False, role="employee", _exports=None,
-                query_cache_path=None):
+def build_agent(file_path, *, generate_eval=False, role="employee", api_key=None,
+                _exports=None, query_cache_path=None):
     """Process a file (pdf/docx/pptx, with caching) and return a ready-to-use agent.
 
     Returns (agent, retrieval_log, reset_turn). retrieval_log is shared by reference with
     the retrieve_context tool so a caller (e.g. the Streamlit UI) can read each turn's
     scores; reset_turn() MUST be called before every agent.invoke().
+
+    api_key: the OpenAI key to use for embeddings + the LLM. If None, falls back to the
+    .env key (config.api_key) — so the Streamlit UI can pass a user-supplied key while the
+    CLI / eval scripts keep using the developer's .env.
 
     _exports: optional dict — if given, the raw retrievers (bm25/semantic/hybrid) and
     chunks are stashed into it before returning, WITHOUT changing the public return
@@ -47,8 +51,11 @@ def build_agent(file_path, *, generate_eval=False, role="employee", _exports=Non
     clearance = clearance_level(role)
     print(f"Agent role: {role} (clearance level {clearance})")
 
+    # use the caller-supplied key (e.g. entered in the UI), else the .env default
+    key = api_key or DEFAULT_OPENAI_KEY
+
     embeddings = CachingEmbeddings(
-        OpenAIEmbeddings(model=EMBED_MODEL, api_key=api_key),
+        OpenAIEmbeddings(model=EMBED_MODEL, api_key=key),
         cache_path=query_cache_path,
     )
 
@@ -56,7 +63,8 @@ def build_agent(file_path, *, generate_eval=False, role="employee", _exports=Non
 
     if generate_eval:
         if not os.path.exists(doc.eval_path):
-            generate_eval_dataset(doc.eval_path, doc.chunk_records, doc.table_metadata, doc.db)
+            generate_eval_dataset(doc.eval_path, doc.chunk_records, doc.table_metadata,
+                                  doc.db, api_key=key)
         else:
             print(f"Eval dataset already exists at {doc.eval_path}")
 
@@ -87,7 +95,7 @@ def build_agent(file_path, *, generate_eval=False, role="employee", _exports=Non
     model = ChatOpenAI(
         model=CHAT_MODEL,
         temperature=AGENT_TEMPERATURE,
-        api_key=api_key,
+        api_key=key,
         max_completion_tokens=MAX_COMPLETION_TOKENS,
     )
 
@@ -121,7 +129,7 @@ def build_agent(file_path, *, generate_eval=False, role="employee", _exports=Non
     return agent, retrieval_log, reset_turn
 
 
-def build_retrievers(file_path, role="employee", query_cache_path=None):
+def build_retrievers(file_path, role="employee", query_cache_path=None, api_key=None):
     """Build (and return) the SAME three retrievers the agent uses, for retrieval
     ablations: {"bm25_retriever", "semantic_retriever", "hybrid_retriever", "chunks"}.
 
@@ -140,6 +148,6 @@ def build_retrievers(file_path, role="employee", query_cache_path=None):
             PROCESSED_DIR, file_hash(file_path), "query_embeddings.json"
         )
     exports = {}
-    build_agent(file_path, generate_eval=False, role=role, _exports=exports,
-                query_cache_path=query_cache_path or None)
+    build_agent(file_path, generate_eval=False, role=role, api_key=api_key,
+                _exports=exports, query_cache_path=query_cache_path or None)
     return exports
