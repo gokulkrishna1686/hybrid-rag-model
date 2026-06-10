@@ -8,8 +8,6 @@ from openai import OpenAI
 
 load_dotenv()
 
-client = OpenAI()
-
 ImageType = Literal[
     "chart", "diagram", "table", "photo", "screenshot",
     "illustration", "logo", "map", "icon", "text_block", "mixed", "other"
@@ -103,7 +101,7 @@ def schema_to_text(schema: ImageSchema) -> str:
     return "\n".join(parts)
 
 
-def create_file(file_path):
+def create_file(client, file_path):
     with open(file_path, "rb") as file_content:
         result = client.files.create(
             file=file_content,
@@ -112,10 +110,15 @@ def create_file(file_path):
         return result.id
 
 
-def generate_image_captions(image_paths):
+def generate_image_captions(image_paths, api_key=None):
+    # build the OpenAI client lazily (and only when there's actually an image to caption),
+    # so importing this module never needs a key — the key is passed in at call time.
+    if not image_paths:
+        return []
+    client = OpenAI(api_key=api_key)
     descriptions = []
     for image_path in image_paths:
-        file_id = create_file(image_path)
+        file_id = create_file(client, image_path)
         response = client.responses.parse(
             model="gpt-4o",
             instructions=(
@@ -184,7 +187,7 @@ def extract_images_from_zip(file_path, media_prefix, output_folder="images"):
     return image_paths
 
 
-def extract_and_caption_images(file_path, output_folder="images"):
+def extract_and_caption_images(file_path, output_folder="images", api_key=None):
 
     ext = os.path.splitext(file_path)[1].lower()
 
@@ -197,7 +200,7 @@ def extract_and_caption_images(file_path, output_folder="images"):
     else:
         image_paths = []
 
-    return generate_image_captions(image_paths)
+    return generate_image_captions(image_paths, api_key=api_key)
 
 
 def descriptions_to_serializable(descriptions):

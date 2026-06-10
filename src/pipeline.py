@@ -124,7 +124,7 @@ def _load_cached_index(doc_hash, paths, embeddings):
     return chunks, parents_by_id, chunk_records, vectorstore
 
 
-def _process_and_index(file_path, doc_hash, paths, embeddings):
+def _process_and_index(file_path, doc_hash, paths, embeddings, api_key=None):
     """Cache miss: load text, split parent/child, caption images, enrich parents, persist
     the chunk/parent json, and (re)build the Chroma store. Returns
     (chunks, parents_by_id, chunk_records, vectorstore)."""
@@ -140,7 +140,8 @@ def _process_and_index(file_path, doc_hash, paths, embeddings):
         with open(paths["image_cache"], "r", encoding="utf-8") as f:
             image_descriptions = descriptions_from_serializable(json.load(f))
     else:
-        image_descriptions = extract_and_caption_images(file_path, output_folder=paths["images_dir"])
+        image_descriptions = extract_and_caption_images(
+            file_path, output_folder=paths["images_dir"], api_key=api_key)
         with open(paths["image_cache"], "w", encoding="utf-8") as f:
             json.dump(descriptions_to_serializable(image_descriptions), f,
                       indent=4, ensure_ascii=False)
@@ -218,9 +219,10 @@ def _process_and_index(file_path, doc_hash, paths, embeddings):
     return chunks, parents_by_id, chunk_records, vectorstore
 
 
-def process_document(file_path, embeddings):
+def process_document(file_path, embeddings, api_key=None):
     """Process a file (pdf/docx/pptx) into a ProcessedDoc, using the per-file cache when
-    available. `embeddings` is the (caching) embeddings backend used for the Chroma store."""
+    available. `embeddings` is the (caching) embeddings backend used for the Chroma store;
+    `api_key` is used for image captioning (only when a fresh doc actually has images)."""
     doc_hash = file_hash(file_path)
     processed_dir = str(PROCESSED_DIR / doc_hash)
     paths = _doc_paths(processed_dir)
@@ -239,7 +241,7 @@ def process_document(file_path, embeddings):
         )
     else:
         chunks, parents_by_id, chunk_records, vectorstore = _process_and_index(
-            file_path, doc_hash, paths, embeddings
+            file_path, doc_hash, paths, embeddings, api_key
         )
 
     return ProcessedDoc(

@@ -59,7 +59,7 @@ def build_agent(file_path, *, generate_eval=False, role="employee", api_key=None
         cache_path=query_cache_path,
     )
 
-    doc = process_document(file_path, embeddings)
+    doc = process_document(file_path, embeddings, api_key=key)
 
     if generate_eval:
         if not os.path.exists(doc.eval_path):
